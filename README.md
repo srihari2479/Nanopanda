@@ -42,9 +42,9 @@
 ---
 
 ### 🎭 Emotion Detection
-<img src="assets/emotion_detection.png" width="240"/> <img src="assets/emotion_happy.png" width="190"/> <img src="assets/emotion_sad.png" width="190"/> <img src="assets/emotion_fear.png" width="190"/>
+<img src="assets/emotion_detection.png" width="190"/> <img src="assets/emotion_happy.png" width="190"/> <img src="assets/emotion_sad.png" width="190"/> <img src="assets/emotion_fear.png" width="190"/> <img src="assets/Anger.png" width="190"/> <img src="assets/Disgust.png" width="190"/> <img src="assets/Neutral.png" width="190"/>
 
-*AI-powered facial expression analysis • Real-time processing • Emotion-specific themed results*
+*AI-powered facial expression analysis • Real-time processing • 6 emotions with unique themed results*
 
 ---
 
@@ -63,9 +63,9 @@
 ---
 
 ### ⚙️ Settings & Configuration
-<img src="assets/settings_main.png" width="240"/> <img src="assets/settings_about.png" width="240"/> <img src="assets/settings_reregister_dialog.png" width="240"/>
+<img src="assets/settings_main.png" width="240"/> <img src="assets/settings_about.png" width="240"/> <img src="assets/settings_reregister_dialog.png" width="240"/> <img src="assets/Logout.png" width="240"/> <img src="assets/ResetData.png" width="240"/>
 
-*Complete face data control • Monitoring preferences • Privacy settings management*
+*Complete face data control • Monitoring preferences • Privacy settings • Secure logout • Data reset options*
 
 </div>
 
@@ -159,6 +159,8 @@ Each emotion features a unique visual experience:
 | 😢 **Sad** | Cool blue gradient | Gentle waves, calm motion |
 | 😰 **Fear** | Deep purple gradient | Subtle dark animations |
 | 😐 **Neutral** | Calm gray gradient | Minimal, balanced motion |
+| 😠 **Angry** | Bold red gradient | Dynamic, intense animations |
+| 🤢 **Disgust** | Green gradient | Aversion-themed visual effects |
 
 ### Dashboard Components
 
@@ -838,9 +840,8 @@ SOFTWARE.
 
 - **Issues**: [GitHub Issues](https://github.com/srihari2479/Nanopanda/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/srihari2479/Nanopanda/discussions)
-- **Email**: support@nanopanda.app
-- **Website**: https://nanopanda.app
-- **Documentation**: https://docs.nanopanda.app
+- **Email**: sriharichoppa12@gmail.com
+- **Phone**: +91 9948370693
 
 ---
 
@@ -902,7 +903,6 @@ git push -u origin main
 ⭐ Star this repo if you found it helpful!
 
 <br/>
-
 
 *Developed by Team Nano Panda*
 
