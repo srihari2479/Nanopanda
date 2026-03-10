@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_animate/flutter_animate.dart';
+import 'package:provider/provider.dart';
 
 import '../../../../theme/theme.dart';
+import '../../../../core/providers/monitoring_provider.dart';
 import '../widgets/dashboard_card.dart';
 import '../widgets/animated_background.dart';
 
@@ -186,103 +188,200 @@ class _DashboardPageState extends State<DashboardPage>
 
         const SizedBox(height: AppTheme.spacingM),
 
-        // Two cards side by side
-        IntrinsicHeight(
-          child: Row(
-            children: [
-              // Monitor Apps Card
-              Expanded(
-                child: DashboardCard(
-                  title: 'Monitor Apps',
-                  subtitle: 'Track app usage',
-                  icon: Icons.apps,
-                  gradientColors: const [
-                    Color(0xFF11998E),
-                    Color(0xFF38EF7D),
-                  ],
-                  onTap: () => _navigateTo('/app-selection'),
-                ),
+        // FIX pixel overflow: DashboardCard has a fixed height already —
+        // wrapping in IntrinsicHeight added extra constraints causing 1.8px overflow
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Monitor Apps Card
+            Expanded(
+              child: DashboardCard(
+                title: 'Monitor Apps',
+                subtitle: 'Track app usage',
+                icon: Icons.apps,
+                gradientColors: const [
+                  Color(0xFF11998E),
+                  Color(0xFF38EF7D),
+                ],
+                onTap: () => _navigateTo('/app-selection'),
               ),
+            ),
 
-              const SizedBox(width: AppTheme.spacingM),
+            const SizedBox(width: AppTheme.spacingM),
 
-              // Settings Card
-              Expanded(
-                child: DashboardCard(
-                  title: 'Settings',
-                  subtitle: 'Configure app',
-                  icon: Icons.settings,
-                  gradientColors: const [
-                    Color(0xFFFF416C),
-                    Color(0xFFFF4B2B),
-                  ],
-                  onTap: () => _navigateTo('/settings'),
-                ),
+            // Settings Card
+            Expanded(
+              child: DashboardCard(
+                title: 'Settings',
+                subtitle: 'Configure app',
+                icon: Icons.settings,
+                gradientColors: const [
+                  Color(0xFFFF416C),
+                  Color(0xFFFF4B2B),
+                ],
+                onTap: () => _navigateTo('/settings'),
               ),
-            ],
-          ),
+            ),
+          ],
         ).animate().fadeIn(delay: 600.ms).slideY(begin: 0.1),
       ],
     );
   }
 
   Widget _buildQuickStats() {
-    return Container(
-      padding: const EdgeInsets.all(AppTheme.spacingM),
-      decoration: AppTheme.glassDecoration(opacity: 0.05),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'Quick Stats',
-            style: GoogleFonts.poppins(
-              fontSize: 18,
-              fontWeight: FontWeight.w600,
-              color: AppTheme.textPrimary,
-            ),
-          ),
-          const SizedBox(height: AppTheme.spacingM),
-          IntrinsicHeight(
-            child: Row(
-              children: [
-                Expanded(
-                  child: _buildStatItem(
-                    icon: Icons.shield_outlined,
-                    label: 'Security Score',
-                    value: '98%',
-                    color: AppTheme.success,
+    return Consumer<MonitoringProvider>(
+      builder: (context, monitoring, _) {
+        final isActive      = monitoring.isMonitoring;
+        final totalAlerts   = monitoring.stats.totalAlerts;
+        final todayAlerts   = monitoring.stats.todayAlerts;
+        final unauthTime    = monitoring.stats.totalUnauthorizedTime;
+        final selectedCount = monitoring.selectedCount;
+        final activeSession = monitoring.activeSession;
+
+        // Security score: starts at 100%, drops 5 per today alert, min 50%
+        final score = isActive
+            ? (100 - (todayAlerts * 5)).clamp(50, 100)
+            : selectedCount > 0 ? 72 : 50;
+
+        final scoreColor = score >= 90
+            ? AppTheme.success
+            : score >= 70
+            ? AppTheme.warning
+            : AppTheme.error;
+
+        return Container(
+          padding: const EdgeInsets.all(AppTheme.spacingM),
+          decoration: AppTheme.glassDecoration(opacity: 0.05),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    'Quick Stats',
+                    style: GoogleFonts.poppins(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600,
+                      color: AppTheme.textPrimary,
+                    ),
                   ),
-                ),
-                Container(
-                  width: 1,
-                  color: AppTheme.textMuted.withOpacity(0.2),
-                ),
-                Expanded(
-                  child: _buildStatItem(
-                    icon: Icons.access_time,
-                    label: 'Active Time',
-                    value: '2h 45m',
-                    color: AppTheme.info,
+                  // Live alert badge
+                  if (todayAlerts > 0)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: AppTheme.error.withOpacity(0.15),
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                            color: AppTheme.error.withOpacity(0.4)),
+                      ),
+                      child: Text(
+                        '$todayAlerts alert${todayAlerts > 1 ? 's' : ''} today',
+                        style: GoogleFonts.inter(
+                            fontSize: 11,
+                            color: AppTheme.error,
+                            fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                ],
+              ),
+              const SizedBox(height: AppTheme.spacingM),
+              Row(
+                children: [
+                  Expanded(
+                    child: _buildStatItem(
+                      icon: Icons.shield_outlined,
+                      label: 'Security Score',
+                      value: '$score%',
+                      color: scoreColor,
+                    ),
                   ),
-                ),
+                  Container(
+                    width: 1, height: 60,
+                    color: AppTheme.textMuted.withOpacity(0.2),
+                  ),
+                  Expanded(
+                    child: _buildStatItem(
+                      icon: Icons.access_time,
+                      label: 'Unauth Time',
+                      value: _fmtDuration(unauthTime),
+                      color: unauthTime.inSeconds > 0
+                          ? AppTheme.error
+                          : AppTheme.info,
+                    ),
+                  ),
+                  Container(
+                    width: 1, height: 60,
+                    color: AppTheme.textMuted.withOpacity(0.2),
+                  ),
+                  Expanded(
+                    child: _buildStatItem(
+                      icon: Icons.warning_amber_outlined,
+                      label: 'Total Alerts',
+                      value: '$totalAlerts',
+                      color: totalAlerts > 0
+                          ? AppTheme.warning
+                          : AppTheme.success,
+                    ),
+                  ),
+                ],
+              ),
+              // Live session banner
+              if (activeSession != null) ...[
+                const SizedBox(height: 10),
                 Container(
-                  width: 1,
-                  color: AppTheme.textMuted.withOpacity(0.2),
-                ),
-                Expanded(
-                  child: _buildStatItem(
-                    icon: Icons.warning_amber_outlined,
-                    label: 'Alerts',
-                    value: '0',
-                    color: AppTheme.warning,
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: AppTheme.error.withOpacity(0.1),
+                    borderRadius:
+                    BorderRadius.circular(AppTheme.radiusMedium),
+                    border: Border.all(
+                        color: AppTheme.error.withOpacity(0.35)),
+                  ),
+                  child: Row(
+                    children: [
+                      Container(
+                        width: 8, height: 8,
+                        decoration: const BoxDecoration(
+                            color: AppTheme.error, shape: BoxShape.circle),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '⚠ LIVE: ${activeSession.appName} — '
+                              '${_elapsed(activeSession.elapsed)}',
+                          style: GoogleFonts.inter(
+                            fontSize: 12,
+                            color: AppTheme.error,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],
-            ),
+            ],
           ),
-        ],
-      ),
-    ).animate().fadeIn(delay: 700.ms).slideY(begin: 0.1);
+        ).animate().fadeIn(delay: 700.ms).slideY(begin: 0.1);
+      },
+    );
+  }
+
+  String _fmtDuration(Duration d) {
+    if (d.inSeconds == 0) return '0s';
+    if (d.inHours > 0) return '${d.inHours}h ${d.inMinutes % 60}m';
+    if (d.inMinutes > 0) return '${d.inMinutes}m';
+    return '${d.inSeconds}s';
+  }
+
+  String _elapsed(Duration d) {
+    if (d.inHours > 0) return '${d.inHours}h ${d.inMinutes % 60}m';
+    if (d.inMinutes > 0) return '${d.inMinutes}m ${d.inSeconds % 60}s';
+    return '${d.inSeconds}s';
   }
 
   Widget _buildStatItem({

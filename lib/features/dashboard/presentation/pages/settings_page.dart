@@ -6,6 +6,7 @@ import 'package:flutter_animate/flutter_animate.dart';
 
 import '../../../../theme/theme.dart';
 import '../../../../core/providers/app_state_provider.dart';
+import '../../../../core/providers/monitoring_provider.dart';
 import '../../../../core/services/storage_service.dart';
 import '../../../../core/utils/constants.dart';
 
@@ -234,7 +235,11 @@ class _SettingsPageState extends State<SettingsPage> {
           value: _backgroundMonitoring,
           onChanged: (value) async {
             setState(() => _backgroundMonitoring = value);
-            await context.read<AppStateProvider>().setMonitoringEnabled(value);
+            // FIX H3: Call MonitoringProvider so monitoring actually starts/stops.
+            // Previously only called AppStateProvider.setMonitoringEnabled() which
+            // just flipped a flag — no actual monitoring was started or stopped.
+            await context.read<MonitoringProvider>()
+                .setMonitoringEnabledFromSettings(value);
           },
         ),
         _buildSwitchTile(
@@ -370,7 +375,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 padding: const EdgeInsets.all(10),
                 decoration: BoxDecoration(
                   color: (isDestructive ? AppTheme.error : AppTheme.primaryPurple)
-                      .withOpacity(0.15),
+                      .withValues(alpha: 0.15),
                   borderRadius: BorderRadius.circular(AppTheme.radiusSmall),
                 ),
                 child: Icon(
@@ -431,7 +436,7 @@ class _SettingsPageState extends State<SettingsPage> {
           Container(
             padding: const EdgeInsets.all(10),
             decoration: BoxDecoration(
-              color: AppTheme.primaryPurple.withOpacity(0.15),
+              color: AppTheme.primaryPurple.withValues(alpha: 0.15),
               borderRadius: BorderRadius.circular(AppTheme.radiusSmall),
             ),
             child: Icon(icon, color: AppTheme.primaryPurple, size: 20),
@@ -486,7 +491,7 @@ class _SettingsPageState extends State<SettingsPage> {
           Container(
             padding: const EdgeInsets.all(10),
             decoration: BoxDecoration(
-              color: AppTheme.primaryPurple.withOpacity(0.15),
+              color: AppTheme.primaryPurple.withValues(alpha: 0.15),
               borderRadius: BorderRadius.circular(AppTheme.radiusSmall),
             ),
             child: Icon(icon, color: AppTheme.primaryPurple, size: 20),
@@ -521,7 +526,7 @@ class _SettingsPageState extends State<SettingsPage> {
         width: double.infinity,
         padding: const EdgeInsets.symmetric(vertical: 16),
         decoration: BoxDecoration(
-          border: Border.all(color: AppTheme.error.withOpacity(0.5)),
+          border: Border.all(color: AppTheme.error.withValues(alpha: 0.5)),
           borderRadius: BorderRadius.circular(AppTheme.radiusMedium),
         ),
         child: Center(

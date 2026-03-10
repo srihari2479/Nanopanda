@@ -156,7 +156,8 @@ class _DashboardCardState extends State<DashboardCard>
                   padding: const EdgeInsets.all(AppTheme.spacingM),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    mainAxisAlignment: MainAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.max,
                     children: [
                       // Icon container
                       Container(
@@ -172,27 +173,37 @@ class _DashboardCardState extends State<DashboardCard>
                         ),
                       ),
 
-                      // Text content
-                      Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            widget.title,
-                            style: GoogleFonts.poppins(
-                              fontSize: widget.isLarge ? 20 : 16,
-                              fontWeight: FontWeight.w600,
-                              color: Colors.white,
+                      const Spacer(),
+
+                      // Text content — padded right so it never overlaps arrow
+                      Padding(
+                        padding: const EdgeInsets.only(right: 44),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              widget.title,
+                              style: GoogleFonts.poppins(
+                                fontSize: widget.isLarge ? 20 : 16,
+                                fontWeight: FontWeight.w600,
+                                color: Colors.white,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
                             ),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            widget.subtitle,
-                            style: GoogleFonts.inter(
-                              fontSize: widget.isLarge ? 14 : 12,
-                              color: Colors.white.withOpacity(0.8),
+                            const SizedBox(height: 2),
+                            Text(
+                              widget.subtitle,
+                              style: GoogleFonts.inter(
+                                fontSize: widget.isLarge ? 14 : 12,
+                                color: Colors.white.withOpacity(0.8),
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
                     ],
                   ),

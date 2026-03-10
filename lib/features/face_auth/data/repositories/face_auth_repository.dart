@@ -1,176 +1,161 @@
+// lib/features/face_auth/data/repositories/face_auth_repository.dart
+//
+// Production face-auth repository — fully fixed.
+//
+// ── Changes vs original ───────────────────────────────────────────────────────
+//  • registerFaceFromFrames: accepts _targetFrames (8) instead of 5 — matches
+//    the updated registration page for a more robust stored template.
+//  • verifyFace: threshold now sourced from AppConstants (80%).
+//    The matchPercentage formula is clamped to [0, 100] to prevent edge-case
+//    values outside range from slipping through.
+//  • L2 normalisation in registerFaceFromFrames: norm=0 guard added (avoids
+//    division-by-zero when averaging produces an all-zero vector).
+//  • All debug prints prefixed consistently for easy log filtering.
+
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
+
 import '../../../../core/models/face_vector_model.dart';
+import '../../../../core/services/ml_face_service.dart';
 import '../../../../core/utils/constants.dart';
 
-/// Face Authentication Repository
-/// Handles all face authentication operations with mocked backend
-class FaceAuthRepository {
-  /// Register face with backend (MOCKED)
-  /// Returns success after simulated delay
-  Future<FaceRegistrationResult> registerFace(List<double> vector) async {
-    // Simulate API call delay
-    await Future.delayed(AppConstants.apiSimulationDelay);
+// ─────────────────────────────────────────────────────────────────────────────
+// Result types
+// ─────────────────────────────────────────────────────────────────────────────
 
-    // Generate mock user ID
-    final userId = 'user_${DateTime.now().millisecondsSinceEpoch}';
-
-    // Simulate 95% success rate
-    final random = math.Random();
-    if (random.nextDouble() > 0.05) {
-      return FaceRegistrationResult.success(
-        userId: userId,
-        message: 'Face registered successfully',
-      );
-    } else {
-      return FaceRegistrationResult.failure(
-        message: 'Registration failed. Please try again.',
-      );
-    }
-  }
-
-  /// Verify face against stored vector (LOCAL)
-  /// Compares live face vector with stored vector
-  Future<FaceVerificationResult> verifyFace({
-    required FaceVectorModel liveVector,
-    required FaceVectorModel storedVector,
-  }) async {
-    // Simulate processing delay
-    await Future.delayed(const Duration(milliseconds: 500));
-
-    // In production, this would use the actual calculated match:
-    // final actualMatch = liveVector.compareWith(storedVector);
-
-    // For demo: generate realistic match percentage (80-98%)
-    final random = math.Random();
-    final simulatedMatch = 80 + random.nextDouble() * 18;
-
-    if (simulatedMatch >= AppConstants.faceMatchThreshold * 100) {
-      return FaceVerificationResult.success(simulatedMatch);
-    } else {
-      return FaceVerificationResult.failure(
-        'Face mismatch detected',
-        FaceVerificationStatus.mismatch,
-      );
-    }
-  }
-
-  /// Upload face vector to backend (MOCKED)
-  Future<bool> uploadToBackend({
-    required String userId,
-    required List<double> vector,
-  }) async {
-    // Simulate API call
-    await Future.delayed(AppConstants.apiSimulationDelay);
-
-    // Simulate 90% success rate
-    final random = math.Random();
-    return random.nextDouble() > 0.1;
-  }
-
-  /// Generate mock face vector from image
-  /// In production, this would use ML model for face embedding
-  Future<FaceVectorModel?> generateFaceVector({
-    required List<int> imageBytes,
-    String? userId,
-  }) async {
-    // Simulate processing delay
-    await Future.delayed(const Duration(seconds: 1));
-
-    // Generate mock vector
-    return FaceVectorModel.generateMock(userId: userId);
-  }
-
-  /// Check if face is detected in image (MOCKED)
-  Future<FaceDetectionResult> detectFace(List<int> imageBytes) async {
-    // Simulate processing
-    await Future.delayed(const Duration(milliseconds: 300));
-
-    // Simulate detection results
-    final random = math.Random();
-    final detectionScore = random.nextDouble();
-
-    if (detectionScore > 0.2) {
-      // Face detected
-      return FaceDetectionResult(
-        faceDetected: true,
-        isBlurry: detectionScore < 0.4,
-        confidence: detectionScore,
-        boundingBox: FaceBoundingBox(
-          left: 100 + random.nextInt(50).toDouble(),
-          top: 150 + random.nextInt(50).toDouble(),
-          width: 200 + random.nextInt(50).toDouble(),
-          height: 250 + random.nextInt(50).toDouble(),
-        ),
-      );
-    } else {
-      // No face detected
-      return FaceDetectionResult(
-        faceDetected: false,
-        isBlurry: false,
-        confidence: 0,
-      );
-    }
-  }
-}
-
-/// Face registration result
 class FaceRegistrationResult {
   final bool isSuccess;
   final String? userId;
   final String message;
+  final FaceVectorModel? faceVector;
 
-  FaceRegistrationResult({
+  FaceRegistrationResult._({
     required this.isSuccess,
     this.userId,
     required this.message,
+    this.faceVector,
   });
 
   factory FaceRegistrationResult.success({
     required String userId,
-    required String message,
-  }) {
-    return FaceRegistrationResult(
-      isSuccess: true,
-      userId: userId,
-      message: message,
-    );
-  }
+    required FaceVectorModel faceVector,
+  }) =>
+      FaceRegistrationResult._(
+        isSuccess: true,
+        userId: userId,
+        message: 'Face registered successfully',
+        faceVector: faceVector,
+      );
 
-  factory FaceRegistrationResult.failure({required String message}) {
-    return FaceRegistrationResult(
-      isSuccess: false,
-      message: message,
-    );
-  }
+  factory FaceRegistrationResult.failure(String message) =>
+      FaceRegistrationResult._(isSuccess: false, message: message);
 }
 
-/// Face detection result
-class FaceDetectionResult {
-  final bool faceDetected;
-  final bool isBlurry;
-  final double confidence;
-  final FaceBoundingBox? boundingBox;
+// ─────────────────────────────────────────────────────────────────────────────
+// Repository
+// ─────────────────────────────────────────────────────────────────────────────
 
-  FaceDetectionResult({
-    required this.faceDetected,
-    required this.isBlurry,
-    required this.confidence,
-    this.boundingBox,
-  });
-}
+class FaceAuthRepository {
+  /// Minimum frames required for registration. Must match FaceRegistrationPage.
+  static const int _registrationFrameCount = 8;
 
-/// Face bounding box coordinates
-class FaceBoundingBox {
-  final double left;
-  final double top;
-  final double width;
-  final double height;
+  // ── Registration ─────────────────────────────────────────────────────────────
 
-  FaceBoundingBox({
-    required this.left,
-    required this.top,
-    required this.width,
-    required this.height,
-  });
+  /// Average [collectedEmbeddings] into a single L2-normalised stored template.
+  /// Requires at least [_registrationFrameCount] good-quality frames.
+  Future<FaceRegistrationResult> registerFaceFromFrames({
+    required List<List<double>> collectedEmbeddings,
+    required String? userId,
+  }) async {
+    if (collectedEmbeddings.length < _registrationFrameCount) {
+      return FaceRegistrationResult.failure(
+        'Not enough frames captured '
+            '(${collectedEmbeddings.length}/$_registrationFrameCount). '
+            'Hold still and ensure good lighting.',
+      );
+    }
+
+    try {
+      final dim      = collectedEmbeddings.first.length;
+      final averaged = List<double>.filled(dim, 0.0);
+
+      for (final emb in collectedEmbeddings) {
+        for (int i = 0; i < dim; i++) {
+          averaged[i] += emb[i];
+        }
+      }
+      for (int i = 0; i < dim; i++) {
+        averaged[i] /= collectedEmbeddings.length;
+      }
+
+      // L2 normalise — guard against degenerate all-zero vector
+      double norm = 0;
+      for (final v in averaged) norm += v * v;
+      norm = math.sqrt(norm);
+      final normalised = norm < 1e-10
+          ? averaged // already zero-ish, leave as-is
+          : averaged.map((v) => v / norm).toList();
+
+      final finalUserId =
+          userId ?? 'user_${DateTime.now().millisecondsSinceEpoch}';
+
+      final faceVector = FaceVectorModel(
+        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        vector: normalised,
+        createdAt: DateTime.now(),
+        userId: finalUserId,
+      );
+
+      debugPrint('[FaceAuthRepo] registered ${collectedEmbeddings.length} '
+          'frames → userId=$finalUserId');
+
+      return FaceRegistrationResult.success(
+        userId: finalUserId,
+        faceVector: faceVector,
+      );
+    } catch (e) {
+      debugPrint('[FaceAuthRepo] registerFaceFromFrames error: $e');
+      return FaceRegistrationResult.failure('Registration processing failed');
+    }
+  }
+
+  // ── Verification ─────────────────────────────────────────────────────────────
+
+  /// Compares [liveVector] against [storedVector].
+  /// Uses cosine similarity via [MlFaceService.matchPercentage].
+  /// Threshold = [AppConstants.faceMatchThreshold] (80 %).
+  Future<FaceVerificationResult> verifyFace({
+    required FaceVectorModel liveVector,
+    required FaceVectorModel storedVector,
+  }) async {
+    try {
+      final score = MlFaceService.matchPercentage(
+        storedVector.vector,
+        liveVector.vector,
+      ).clamp(0.0, 100.0); // safety clamp
+
+      debugPrint('[FaceAuthRepo] averaged match score: ${score.toStringAsFixed(2)}%');
+
+      final threshold = AppConstants.faceMatchThreshold * 100;
+
+      if (score >= threshold) {
+        return FaceVerificationResult.success(score);
+      } else {
+        return FaceVerificationResult.failure(
+          'Face does not match (${score.toStringAsFixed(1)}%)',
+          FaceVerificationStatus.mismatch,
+        );
+      }
+    } catch (e) {
+      debugPrint('[FaceAuthRepo] verifyFace error: $e');
+      return FaceVerificationResult.failure(
+        'Verification error',
+        FaceVerificationStatus.unknownError,
+      );
+    }
+  }
+
+  /// Minimum frames required for registration.
+  static int get requiredFrames => _registrationFrameCount;
 }

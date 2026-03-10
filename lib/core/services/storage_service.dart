@@ -162,7 +162,42 @@ class StorageService {
     return _prefs.get(key) as T?;
   }
 
-  // ==================== CLEAR ALL DATA ====================
+  // ==================== INSTALLED APPS CACHE ====================
+
+  static const _kAppsCache   = 'installed_apps_cache';
+  static const _kAppsCacheTs = 'installed_apps_cache_ts';
+
+  /// Save installed apps list to cache (fast local load next time)
+  Future<void> saveInstalledAppsCache(List<AppInfoModel> apps) async {
+    _ensureInitialized();
+    await _prefs.setString(_kAppsCache, AppInfoModel.serializeList(apps));
+    await _prefs.setInt(_kAppsCacheTs, DateTime.now().millisecondsSinceEpoch);
+  }
+
+  /// Get cached installed apps. Returns empty list if no cache exists.
+  Future<List<AppInfoModel>> getInstalledAppsCache() async {
+    _ensureInitialized();
+    final data = _prefs.getString(_kAppsCache);
+    return AppInfoModel.deserializeList(data);
+  }
+
+  /// Age of the installed apps cache. Null = no cache.
+  Duration? getInstalledAppsCacheAge() {
+    _ensureInitialized();
+    final ts = _prefs.getInt(_kAppsCacheTs);
+    if (ts == null) return null;
+    return DateTime.now()
+        .difference(DateTime.fromMillisecondsSinceEpoch(ts));
+  }
+
+  /// Force-clear the installed apps cache.
+  Future<void> clearInstalledAppsCache() async {
+    _ensureInitialized();
+    await _prefs.remove(_kAppsCache);
+    await _prefs.remove(_kAppsCacheTs);
+  }
+
+
 
   /// Clear all stored data (for logout/reset)
   Future<void> clearAllData() async {

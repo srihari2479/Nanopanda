@@ -1,15 +1,41 @@
+// lib/features/face_auth/presentation/pages/face_registration_page.dart
+//
+// Production face-registration page — fully fixed & hardened.
+//
+// Flow:
+//   1. Camera + MlFaceService initialise in parallel.
+//   2. LivenessService: blink → head-turn (guards against photo attacks).
+//   3. After liveness passes, collect _targetFrames good-quality embeddings.
+//   4. FaceAuthRepository averages & L2-normalises → FaceVectorModel.
+//   5. StorageService persists the vector in FlutterSecureStorage.
+//   6. Navigate to /login.
+//
+// ── Bug-fixes vs original ────────────────────────────────────────────────────
+//  • _isCapturing guard — listener sets flag atomically; frame handler checks
+//    it before adding, preventing double-capture on fast callbacks.
+//  • Stream stop race — stopImageStream() awaited inside the frame handler
+//    with a _streamStopped flag so it is called exactly once.
+//  • Dispose order — camera stream stopped before dispose() to avoid
+//    "use after dispose" errors on CameraController.
+//  • setState after dispose — every setState is guarded with `if (!mounted)`.
+//  • Retry path — liveness reset + embeddings clear happen atomically.
+//  • Progress clamped to [0,1] to avoid assert in LinearProgressIndicator.
+
+import 'dart:math' as math;
+
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:provider/provider.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_animate/flutter_animate.dart';
-import 'package:camera/camera.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:provider/provider.dart';
 
-import '../../../../theme/theme.dart';
-import '../../../../core/services/storage_service.dart';
 import '../../../../core/providers/app_state_provider.dart';
-import '../../../../core/models/face_vector_model.dart';
 import '../../../../core/services/camera_service.dart';
+import '../../../../core/services/ml_face_service.dart';
+import '../../../../core/services/liveness_service.dart';
+import '../../../../core/services/storage_service.dart';
+import '../../../../theme/theme.dart';
 import '../../data/repositories/face_auth_repository.dart';
 import '../widgets/camera_overlay.dart';
 import '../widgets/scanning_animation.dart';
@@ -23,134 +49,264 @@ class FaceRegistrationPage extends StatefulWidget {
 
 class _FaceRegistrationPageState extends State<FaceRegistrationPage>
     with SingleTickerProviderStateMixin {
-  final FaceAuthRepository _repository = FaceAuthRepository();
-  late final CameraService _cameraService;
+  // ── services ─────────────────────────────────────────────────────────────────
+  final _cameraService   = CameraService();
+  final _mlService       = MlFaceService.instance;
+  final _livenessService = LivenessService();
+  final _repository      = FaceAuthRepository();
 
-  late AnimationController _pulseController;
+  // ── animation ────────────────────────────────────────────────────────────────
+  late final AnimationController _pulseController;
 
-  bool _isCameraReady = false;
-  bool _isCapturing = false;
-  bool _isProcessing = false;
-  bool _faceDetected = false;
-  String _statusMessage = 'Initializing camera...';
-  double _progress = 0.0;
+  // ── state ─────────────────────────────────────────────────────────────────────
+  bool _isCameraReady   = false;
+  bool _isMlReady       = false;
+  bool _isCapturing     = false;   // collecting frames
+  bool _isProcessing    = false;   // averaging + saving
+  bool _isDone          = false;   // success overlay
+  bool _processingFrame = false;   // frame-level re-entrancy guard
+  bool _streamStopped   = false;   // ensures stopImageStream called once
+
+  String _statusMessage = 'Initializing…';
+  double _progress      = 0.0;
+
+  final List<List<double>> _embeddings = [];
+  static const int _targetFrames = 8; // more frames = more robust template
 
   @override
   void initState() {
     super.initState();
-    _cameraService = CameraService();
 
     _pulseController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1500),
     )..repeat(reverse: true);
 
-    Future.delayed(const Duration(milliseconds: 300), _initializeCamera);
+    _livenessService.addListener(_onLivenessChanged);
+    Future.delayed(const Duration(milliseconds: 300), _initAll);
   }
 
-  Future<void> _initializeCamera() async {
+  // ── initialisation ───────────────────────────────────────────────────────────
+
+  Future<void> _initAll() async {
+    await Future.wait([_initCamera(), _initMl()]);
+  }
+
+  Future<void> _initCamera() async {
     if (!mounted) return;
+    _safeSetState(() => _statusMessage = 'Starting camera…');
+    try {
+      await _cameraService.initialize();
+      if (!mounted) return;
+      _safeSetState(() {
+        _isCameraReady = true;
+        _statusMessage = _isMlReady ? 'Blink your eyes slowly' : 'Loading face model…';
+      });
+      _startFrameStream();
+    } catch (e) {
+      _safeSetState(() => _statusMessage = 'Camera error: $e');
+      _showError('Unable to access camera');
+    }
+  }
+
+  Future<void> _initMl() async {
+    if (!mounted) return;
+    try {
+      await _mlService.initialize();
+      if (!mounted) return;
+      _safeSetState(() {
+        _isMlReady     = true;
+        _statusMessage = _isCameraReady ? 'Blink your eyes slowly' : 'Starting camera…';
+      });
+    } catch (e) {
+      _safeSetState(() => _statusMessage = 'ML model error: $e');
+      _showError('Face model failed to load');
+    }
+  }
+
+  // ── frame stream ─────────────────────────────────────────────────────────────
+
+  void _startFrameStream() {
+    _streamStopped = false;
+    _cameraService.controller?.startImageStream(_onFrame);
+  }
+
+  Future<void> _stopFrameStream() async {
+    if (_streamStopped) return;
+    _streamStopped = true;
+    try {
+      await _cameraService.controller?.stopImageStream();
+    } catch (_) {}
+  }
+
+  Future<void> _onFrame(CameraImage frame) async {
+    if (!mounted) return;
+    if (!_isMlReady || !_isCameraReady) return;
+    if (_processingFrame || _isProcessing || _isDone) return;
+    if (_streamStopped) return;
+
+    _processingFrame = true;
+    try {
+      final sensorOrientation =
+          _cameraService.controller!.description.sensorOrientation;
+      final result = await _mlService.processFrame(frame, sensorOrientation);
+
+      if (!mounted) return;
+
+      // No face at all
+      if (!result.faceFound) {
+        if (!_isCapturing) {
+          _safeSetState(() => _statusMessage = result.statusMessage);
+        }
+        return;
+      }
+
+      // ── Liveness phase ───────────────────────────────────────────────────────
+      // Feed EVERY frame with a face — including bad-quality ones — so that
+      // the blink (eyes closing = goodQuality false) is always observed.
+      if (!_livenessService.state.isPassed) {
+        _livenessService.processFrame(
+          leftEye:  result.leftEyeOpenProb,
+          rightEye: result.rightEyeOpenProb,
+          eulerY:   result.headEulerY,
+        );
+        if (!result.goodQuality && !_isCapturing) {
+          _safeSetState(() => _statusMessage = result.statusMessage);
+        }
+        return;
+      }
+
+      // ── Capture phase ────────────────────────────────────────────────────────
+      if (!_isCapturing || !result.goodQuality || !result.hasEmbedding) return;
+
+      _embeddings.add(result.embedding!);
+      final captured = _embeddings.length;
+      _safeSetState(() {
+        _progress      = (captured / _targetFrames).clamp(0.0, 1.0);
+        _statusMessage = 'Capturing… $captured/$_targetFrames';
+      });
+
+      if (captured >= _targetFrames) {
+        await _stopFrameStream();
+        await _finalizeRegistration();
+      }
+    } finally {
+      _processingFrame = false;
+    }
+  }
+
+  // ── liveness callback ────────────────────────────────────────────────────────
+
+  void _onLivenessChanged() {
+    if (!mounted) return;
+    final ls = _livenessService.state;
+    _safeSetState(() => _statusMessage = ls.instruction);
+
+    if (ls.isPassed && !_isCapturing && !_isProcessing && !_isDone) {
+      _safeSetState(() {
+        _isCapturing   = true;
+        _statusMessage = 'Liveness verified! Capturing face…';
+      });
+      HapticFeedback.mediumImpact();
+    }
+  }
+
+  // ── finalise registration ────────────────────────────────────────────────────
+
+  Future<void> _finalizeRegistration() async {
+    if (!mounted) return;
+    _safeSetState(() {
+      _isCapturing  = false;
+      _isProcessing = true;
+      _statusMessage = 'Processing face data…';
+      _progress      = 0.85;
+    });
 
     try {
-      setState(() {
-        _isCameraReady = false;
-        _statusMessage = 'Initializing camera...';
-      });
+      final storageService = context.read<StorageService>();
+      final appState       = context.read<AppStateProvider>();
+      final existingUserId = await storageService.getUserId();
 
-      await _cameraService.initialize();
+      final result = await _repository.registerFaceFromFrames(
+        collectedEmbeddings: _embeddings,
+        userId: existingUserId,
+      );
 
       if (!mounted) return;
 
-      await Future.delayed(const Duration(milliseconds: 200));
-
-      if (mounted) {
-        setState(() {
-          _isCameraReady = true;
-          _statusMessage = 'Position your face in the frame';
-          _faceDetected = true; // TODO: hook real detection later
+      if (result.isSuccess) {
+        _safeSetState(() {
+          _progress      = 1.0;
+          _statusMessage = 'Registration successful!';
+          _isProcessing  = false;
+          _isDone        = true;
         });
+
+        await storageService.saveFaceVector(result.faceVector!);
+        if (result.userId != null) {
+          await storageService.saveUserId(result.userId!);
+        }
+        await appState.setFaceRegistered(true);
+
+        HapticFeedback.heavyImpact();
+        // BUG FIX: Stop and dispose the camera BEFORE navigating to the
+        // login page. If we navigate immediately, the login page tries to
+        // open the same camera hardware while this page is still holding it
+        // (dispose() runs asynchronously during page pop). This caused the
+        // camera to silently fail on the login page — showing only the radar
+        // animation with a black/empty circle instead of the camera preview.
+        await _stopFrameStream();
+        await _cameraService.dispose();
+        await Future.delayed(const Duration(milliseconds: 600));
+        if (mounted) Navigator.of(context).pushReplacementNamed('/login');
+      } else {
+        _safeSetState(() {
+          _isProcessing  = false;
+          _isCapturing   = false;
+          _statusMessage = result.message;
+          _progress      = 0.0;
+        });
+        _embeddings.clear();
+        _livenessService.reset();
+        _showError(result.message);
+        _startFrameStream(); // retry
       }
     } catch (e) {
-      debugPrint('Camera init error: $e');
-      if (!mounted) return;
-      setState(() {
-        _isCameraReady = false;
-        _statusMessage = 'Camera failed to initialize';
+      _safeSetState(() {
+        _isProcessing  = false;
+        _isCapturing   = false;
+        _statusMessage = 'Registration failed. Try again.';
+        _progress      = 0.0;
       });
-      _showErrorSnackBar('Unable to access camera');
+      _embeddings.clear();
+      _livenessService.reset();
+      _showError('Registration failed. Please try again.');
+      _startFrameStream();
     }
   }
 
-  Future<void> _captureAndRegister() async {
-    if (_isCapturing || _isProcessing || !_isCameraReady) return;
+  // ── helpers ──────────────────────────────────────────────────────────────────
 
-    setState(() {
-      _isCapturing = true;
-      _statusMessage = 'Capturing face...';
-    });
-
-    HapticFeedback.mediumImpact();
-
-    // TODO: capture actual frame from camera
-    await Future.delayed(const Duration(milliseconds: 500));
-
-    setState(() {
-      _isCapturing = false;
-      _isProcessing = true;
-      _statusMessage = 'Processing face data...';
-    });
-
-    for (int i = 0; i <= 100; i += 10) {
-      await Future.delayed(const Duration(milliseconds: 150));
-      if (mounted) {
-        setState(() => _progress = i / 100);
-      }
-    }
-
-    final faceVector = FaceVectorModel.generateMock();
-
-    setState(() => _statusMessage = 'Registering with server...');
-    final result = await _repository.registerFace(faceVector.vector);
-
-    if (result.isSuccess && mounted) {
-      final storageService = context.read<StorageService>();
-      await storageService.saveFaceVector(faceVector);
-      if (result.userId != null) {
-        await storageService.saveUserId(result.userId!);
-      }
-
-      await context.read<AppStateProvider>().setFaceRegistered(true);
-
-      setState(() {
-        _isProcessing = false;
-        _statusMessage = 'Registration successful!';
-      });
-
-      HapticFeedback.heavyImpact();
-
-      await Future.delayed(const Duration(seconds: 1));
-      if (mounted) {
-        Navigator.of(context).pushReplacementNamed('/login');
-      }
-    } else if (mounted) {
-      setState(() {
-        _isProcessing = false;
-        _progress = 0;
-        _statusMessage = result.message;
-      });
-      _showErrorSnackBar(result.message);
-    }
+  void _safeSetState(VoidCallback fn) {
+    if (mounted) setState(fn);
   }
 
-  void _showErrorSnackBar(String message) {
+  void _showError(String msg) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(message),
+        content: Row(
+          children: [
+            const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 20),
+            const SizedBox(width: 8),
+            Expanded(child: Text(msg, style: const TextStyle(color: Colors.white))),
+          ],
+        ),
         backgroundColor: AppTheme.error,
         behavior: SnackBarBehavior.floating,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(AppTheme.radiusMedium),
-        ),
+            borderRadius: BorderRadius.circular(AppTheme.radiusMedium)),
+        duration: const Duration(seconds: 3),
       ),
     );
   }
@@ -158,25 +314,31 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage>
   @override
   void dispose() {
     _pulseController.dispose();
+    _livenessService.removeListener(_onLivenessChanged);
+    _livenessService.dispose();
+    // Only stop stream + dispose camera if not already done in _finalizeRegistration.
+    // Calling stopImageStream on an already-disposed controller crashes on some devices.
+    if (!_streamStopped) {
+      _cameraService.controller?.stopImageStream().catchError((_) {});
+    }
     _cameraService.dispose();
     super.dispose();
   }
+
+  // ── UI ───────────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
     final size = MediaQuery.sizeOf(context);
     return Scaffold(
       body: Container(
-        decoration: const BoxDecoration(
-          gradient: AppTheme.backgroundGradient,
-        ),
+        decoration: const BoxDecoration(gradient: AppTheme.backgroundGradient),
         child: SafeArea(
           child: Column(
             children: [
               _buildHeader(),
-              Expanded(
-                child: _buildCameraSection(size),
-              ),
+              Expanded(child: _buildCameraSection(size)),
+              _buildLivenessIndicator(),
               _buildBottomSection(),
             ],
           ),
@@ -201,10 +363,7 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage>
           const SizedBox(height: 8),
           Text(
             'Secure your device with facial recognition',
-            style: GoogleFonts.inter(
-              fontSize: 14,
-              color: AppTheme.textSecondary,
-            ),
+            style: GoogleFonts.inter(fontSize: 14, color: AppTheme.textSecondary),
           ).animate().fadeIn(delay: 200.ms),
         ],
       ),
@@ -212,18 +371,18 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage>
   }
 
   Widget _buildCameraSection(Size size) {
-    final cameraSize = size.width * 0.85;
+    final camSize = size.width * 0.85;
     return Center(
       child: Stack(
         alignment: Alignment.center,
         children: [
           Container(
-            width: cameraSize,
-            height: cameraSize * 1.2,
+            width: camSize,
+            height: camSize * 1.2,
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(AppTheme.radiusXL),
               boxShadow: AppTheme.glowShadow(
-                AppTheme.primaryPurple,
+                _isDone ? AppTheme.success : AppTheme.primaryPurple,
                 intensity: 0.2,
               ),
             ),
@@ -237,7 +396,7 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage>
                   else
                     _buildLoadingState(),
                   CameraOverlay(
-                    faceDetected: _faceDetected && _isCameraReady,
+                    faceDetected: _isCameraReady && _isMlReady,
                     isScanning: _isCapturing,
                   ),
                   if (_isCapturing) const ScanningAnimation(),
@@ -249,32 +408,58 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage>
             duration: 600.ms,
             curve: Curves.easeOutBack,
           ),
-          if (_isProcessing) _buildProcessingOverlay(cameraSize),
+
+          // Success overlay
+          if (_isDone)
+            Container(
+              width: camSize,
+              height: camSize * 1.2,
+              decoration: BoxDecoration(
+                color: AppTheme.success.withOpacity(0.88),
+                borderRadius: BorderRadius.circular(AppTheme.radiusXL),
+              ),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.check_circle_rounded, size: 80,
+                      color: Colors.white),
+                  const SizedBox(height: 16),
+                  Text(
+                    'Registered!',
+                    style: GoogleFonts.poppins(
+                      fontSize: 28,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Your face is securely saved',
+                    style: GoogleFonts.inter(
+                        fontSize: 14, color: Colors.white.withOpacity(0.85)),
+                  ),
+                ],
+              ),
+            ).animate().fadeIn().scale(),
+
+          // Processing overlay
+          if (_isProcessing && !_isDone) _buildProcessingOverlay(camSize),
         ],
       ),
     );
   }
 
   Widget _buildCameraPreview() {
-    final controller = _cameraService.controller!;
-    final size = controller.value.previewSize!;
-
-    final screenAspectRatio = 1.0 / 1.2;
-    final cameraAspectRatio = size.height / size.width;
-
-    double scale;
-    if (cameraAspectRatio < screenAspectRatio) {
-      scale = screenAspectRatio / cameraAspectRatio;
-    } else {
-      scale = 1.0;
-    }
-
+    final ctrl        = _cameraService.controller!;
+    final previewSize = ctrl.value.previewSize!;
+    final aspectRatio = previewSize.height / previewSize.width;
+    final scale       = math.max(1.0 / (1.2 * aspectRatio), 1.0);
     return Transform.scale(
       scale: scale,
       child: Center(
         child: AspectRatio(
-          aspectRatio: cameraAspectRatio,
-          child: CameraPreview(controller),
+          aspectRatio: aspectRatio,
+          child: CameraPreview(ctrl),
         ),
       ),
     );
@@ -292,23 +477,18 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage>
               height: 50,
               child: CircularProgressIndicator(
                 strokeWidth: 3,
-                valueColor: AlwaysStoppedAnimation(
-                  AppTheme.primaryPurple,
-                ),
+                valueColor: AlwaysStoppedAnimation(AppTheme.primaryPurple),
               ),
-            )
-                .animate(onPlay: (c) => c.repeat())
+            ).animate(onPlay: (c) => c.repeat())
                 .fadeIn(duration: 300.ms)
                 .then()
                 .shimmer(duration: 1000.ms),
             const SizedBox(height: 16),
-            Text(
-              'Initializing camera...',
-              style: GoogleFonts.inter(
-                fontSize: 14,
-                color: AppTheme.textSecondary,
-              ),
-            ).animate().fadeIn(delay: 200.ms),
+            Text('Loading…',
+                style: GoogleFonts.inter(
+                    fontSize: 14, color: AppTheme.textSecondary))
+                .animate()
+                .fadeIn(delay: 200.ms),
           ],
         ),
       ),
@@ -336,16 +516,14 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage>
                   width: 100,
                   height: 100,
                   child: CircularProgressIndicator(
-                    value: _progress,
+                    value: _progress.clamp(0.0, 1.0),
                     strokeWidth: 6,
                     backgroundColor: AppTheme.surfaceDark,
-                    valueColor: AlwaysStoppedAnimation(
-                      AppTheme.primaryPurple,
-                    ),
+                    valueColor: AlwaysStoppedAnimation(AppTheme.primaryPurple),
                   ),
                 ),
                 Text(
-                  '${(_progress * 100).toInt()}%',
+                  '${(_progress.clamp(0.0, 1.0) * 100).toInt()}%',
                   style: GoogleFonts.poppins(
                     fontSize: 20,
                     fontWeight: FontWeight.bold,
@@ -358,14 +536,107 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage>
           const SizedBox(height: 24),
           Text(
             _statusMessage,
-            style: GoogleFonts.inter(
-              fontSize: 16,
-              color: AppTheme.textSecondary,
-            ),
+            style: GoogleFonts.inter(fontSize: 16, color: AppTheme.textSecondary),
           ).animate().fadeIn(),
         ],
       ),
     ).animate().fadeIn(duration: 300.ms);
+  }
+
+  Widget _buildLivenessIndicator() {
+    if (!_isCameraReady || !_isMlReady || _isDone) return const SizedBox.shrink();
+    final ls = _livenessService.state;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 4),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              _livenessStepIcon(
+                icon: Icons.remove_red_eye,
+                done: ls.step.index > LivenessStep.waitingForBlink.index,
+                active: ls.step == LivenessStep.waitingForBlink,
+                label: 'Blink',
+              ),
+              Expanded(
+                child: Divider(
+                  color: ls.step.index > LivenessStep.blinkDetected.index
+                      ? AppTheme.success
+                      : AppTheme.surfaceDark,
+                  thickness: 2,
+                ),
+              ),
+              _livenessStepIcon(
+                icon: Icons.swap_horiz,
+                done: ls.step.index >= LivenessStep.passed.index,
+                active: ls.step == LivenessStep.waitingForTurn ||
+                    ls.step == LivenessStep.turnDetected,
+                label: 'Turn',
+              ),
+              Expanded(
+                child: Divider(
+                  color: ls.step == LivenessStep.passed || _isCapturing
+                      ? AppTheme.success
+                      : AppTheme.surfaceDark,
+                  thickness: 2,
+                ),
+              ),
+              _livenessStepIcon(
+                icon: Icons.camera_alt,
+                done: _isDone,
+                active: _isCapturing,
+                label: 'Capture',
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          if (_isCapturing)
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: _progress.clamp(0.0, 1.0),
+                minHeight: 6,
+                backgroundColor: AppTheme.surfaceDark,
+                valueColor: AlwaysStoppedAnimation(AppTheme.primaryPurple),
+              ),
+            ).animate().fadeIn(),
+        ],
+      ),
+    );
+  }
+
+  Widget _livenessStepIcon({
+    required IconData icon,
+    required bool done,
+    required bool active,
+    required String label,
+  }) {
+    final color = done
+        ? AppTheme.success
+        : active
+        ? AppTheme.primaryPurple
+        : AppTheme.textMuted;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 36,
+          height: 36,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: color.withOpacity(0.15),
+            border: Border.all(color: color, width: active ? 2 : 1),
+          ),
+          child: Icon(
+            done ? Icons.check_rounded : icon,
+            color: color,
+            size: 18,
+          ),
+        ),
+        const SizedBox(height: 2),
+        Text(label, style: GoogleFonts.inter(fontSize: 10, color: color)),
+      ],
+    );
   }
 
   Widget _buildBottomSection() {
@@ -375,110 +646,42 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage>
         children: [
           Container(
             padding: const EdgeInsets.symmetric(
-              horizontal: AppTheme.spacingM,
-              vertical: AppTheme.spacingS,
-            ),
+                horizontal: AppTheme.spacingM, vertical: AppTheme.spacingS),
             decoration: AppTheme.glassDecoration(opacity: 0.05),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
                 Icon(
-                  _isProcessing
-                      ? Icons.hourglass_top
-                      : _faceDetected
-                      ? Icons.check_circle
-                      : Icons.info_outline,
+                  _isDone
+                      ? Icons.check_circle_rounded
+                      : _isCapturing
+                      ? Icons.camera_alt
+                      : _isCameraReady && _isMlReady
+                      ? Icons.face
+                      : Icons.hourglass_top,
                   size: 18,
-                  color: _isProcessing
-                      ? AppTheme.info
-                      : _faceDetected
+                  color: _isDone
                       ? AppTheme.success
-                      : AppTheme.warning,
+                      : _isCapturing
+                      ? AppTheme.primaryPurple
+                      : AppTheme.textMuted,
                 ),
                 const SizedBox(width: 8),
-                Text(
-                  _statusMessage,
-                  style: GoogleFonts.inter(
-                    fontSize: 14,
-                    color: AppTheme.textSecondary,
+                Flexible(
+                  child: Text(
+                    _statusMessage,
+                    style: GoogleFonts.inter(
+                        fontSize: 14, color: AppTheme.textSecondary),
+                    textAlign: TextAlign.center,
                   ),
                 ),
               ],
             ),
           ).animate().fadeIn(delay: 300.ms),
-          const SizedBox(height: AppTheme.spacingL),
-          GestureDetector(
-            onTap: _isCameraReady && _faceDetected && !_isProcessing
-                ? _captureAndRegister
-                : null,
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 200),
-              width: double.infinity,
-              height: 56,
-              decoration: BoxDecoration(
-                gradient: _isCameraReady && _faceDetected && !_isProcessing
-                    ? AppTheme.primaryGradient
-                    : null,
-                color: _isCameraReady && _faceDetected && !_isProcessing
-                    ? null
-                    : AppTheme.surfaceDark,
-                borderRadius: BorderRadius.circular(AppTheme.radiusMedium),
-                boxShadow:
-                _isCameraReady && _faceDetected && !_isProcessing
-                    ? AppTheme.glowShadow(
-                  AppTheme.primaryPurple,
-                  intensity: 0.3,
-                )
-                    : null,
-              ),
-              child: Center(
-                child: _isCapturing
-                    ? SizedBox(
-                  width: 24,
-                  height: 24,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation(
-                      AppTheme.textPrimary,
-                    ),
-                  ),
-                )
-                    : Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      Icons.camera_alt,
-                      color: _isCameraReady &&
-                          _faceDetected &&
-                          !_isProcessing
-                          ? AppTheme.textPrimary
-                          : AppTheme.textMuted,
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      'Register Face',
-                      style: GoogleFonts.inter(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w600,
-                        color: _isCameraReady &&
-                            _faceDetected &&
-                            !_isProcessing
-                            ? AppTheme.textPrimary
-                            : AppTheme.textMuted,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ).animate().fadeIn(delay: 400.ms).slideY(begin: 0.2),
           const SizedBox(height: AppTheme.spacingM),
           Text(
-            'Your face data is encrypted and stored securely',
-            style: GoogleFonts.inter(
-              fontSize: 12,
-              color: AppTheme.textMuted,
-            ),
+            'Your face data is encrypted and stored locally only',
+            style: GoogleFonts.inter(fontSize: 12, color: AppTheme.textMuted),
             textAlign: TextAlign.center,
           ).animate().fadeIn(delay: 500.ms),
         ],

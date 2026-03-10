@@ -5,7 +5,9 @@ import 'package:google_fonts/google_fonts.dart';
 
 import 'theme/theme.dart';
 import 'core/services/storage_service.dart';
+import 'core/services/ml_face_service.dart';
 import 'core/providers/app_state_provider.dart';
+import 'core/providers/monitoring_provider.dart';
 import 'features/face_auth/presentation/pages/face_registration_page.dart';
 import 'features/face_auth/presentation/pages/face_login_page.dart';
 import 'features/dashboard/presentation/pages/dashboard_page.dart';
@@ -18,13 +20,11 @@ import 'features/monitoring/presentation/pages/logs_page.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Set preferred orientations
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
     DeviceOrientation.portraitDown,
   ]);
 
-  // Set system UI overlay style
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
       statusBarColor: Colors.transparent,
@@ -34,15 +34,19 @@ void main() async {
     ),
   );
 
-  // Initialize services
   final storageService = StorageService();
   await storageService.init();
+
+  await MlFaceService.instance.initialize();
 
   runApp(
     MultiProvider(
       providers: [
         Provider<StorageService>.value(value: storageService),
         ChangeNotifierProvider(create: (_) => AppStateProvider(storageService)),
+        ChangeNotifierProvider(
+          create: (_) => MonitoringProvider(storageService),
+        ),
       ],
       child: const FaceGuardApp(),
     ),
@@ -54,36 +58,24 @@ class FaceGuardApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<AppStateProvider>(
-      builder: (context, appState, _) {
-        return MaterialApp(
-          title: 'Nanopanda',
-          debugShowCheckedModeBanner: false,
-          theme: AppTheme.darkTheme,
-          home: _getInitialScreen(appState),
-          onGenerateRoute: _generateRoute,
-        );
-      },
+    return MaterialApp(
+      title: 'Nanopanda',
+      debugShowCheckedModeBanner: false,
+      theme: AppTheme.darkTheme,
+      // BUG FIX: Do NOT wrap MaterialApp in Consumer and change home: based
+      // on state. MaterialApp.home is only read ONCE on the first build.
+      // Any subsequent rebuild of MaterialApp.home is silently ignored by
+      // Flutter's Navigator — the screen never changes.
+      //
+      // CORRECT PATTERN: home: is always the static AppRouter widget.
+      // AppRouter listens to AppStateProvider and imperatively calls
+      // Navigator.pushReplacementNamed() so the correct screen always shows.
+      home: const AppRouter(),
+      onGenerateRoute: _generateRoute,
     );
   }
 
-  Widget _getInitialScreen(AppStateProvider appState) {
-    if (!appState.isInitialized) {
-      return const _SplashScreen();
-    }
-
-    if (!appState.isFaceRegistered) {
-      return const FaceRegistrationPage();
-    }
-
-    if (!appState.isAuthenticated) {
-      return const FaceLoginPage();
-    }
-
-    return const DashboardPage();
-  }
-
-  Route<dynamic>? _generateRoute(RouteSettings settings) {
+  static Route<dynamic>? _generateRoute(RouteSettings settings) {
     switch (settings.name) {
       case '/registration':
         return _buildPageRoute(const FaceRegistrationPage());
@@ -107,7 +99,7 @@ class FaceGuardApp extends StatelessWidget {
     }
   }
 
-  PageRouteBuilder _buildPageRoute(Widget page) {
+  static PageRouteBuilder _buildPageRoute(Widget page) {
     return PageRouteBuilder(
       pageBuilder: (context, animation, secondaryAnimation) => page,
       transitionsBuilder: (context, animation, secondaryAnimation, child) {
@@ -129,6 +121,89 @@ class FaceGuardApp extends StatelessWidget {
     );
   }
 }
+
+/// AppRouter
+///
+/// BUG FIX — Why this widget exists:
+/// The original code wrapped MaterialApp in a Consumer<AppStateProvider> and
+/// changed `home:` based on state. This does NOT work because Flutter's
+/// Navigator only reads `home:` once on the very first build. After that,
+/// rebuilding MaterialApp with a different `home:` is completely ignored —
+/// the navigator stack stays unchanged and the screen never switches.
+///
+/// CORRECT PATTERN used here:
+///   1. AppRouter is always the static home: of MaterialApp.
+///   2. It subscribes to AppStateProvider via addListener.
+///   3. When state changes it calls Navigator.pushReplacementNamed() which
+///      correctly replaces whatever is on the stack.
+///
+/// Screen decision logic:
+///
+///   Fresh install (friend's new phone):
+///     → splash → initialize() finds no face vector
+///     → isFaceRegistered=false → /registration  ✅
+///
+///   Returning user (cold start):
+///     → splash → initialize() finds face vector
+///     → isFaceRegistered=true, isAuthenticated=false → /login  ✅
+///
+///   Authenticated user (resume from recents, process still alive):
+///     → isAuthenticated stays true in memory → /dashboard  ✅
+class AppRouter extends StatefulWidget {
+  const AppRouter({super.key});
+
+  @override
+  State<AppRouter> createState() => _AppRouterState();
+}
+
+class _AppRouterState extends State<AppRouter> {
+  AppStateProvider? _appState;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // didChangeDependencies is the correct place to read Provider
+    // (not initState, where Provider is not yet available).
+    final appState = context.read<AppStateProvider>();
+    if (_appState != appState) {
+      _appState?.removeListener(_onStateChanged);
+      _appState = appState;
+      _appState!.addListener(_onStateChanged);
+    }
+  }
+
+  @override
+  void dispose() {
+    _appState?.removeListener(_onStateChanged);
+    super.dispose();
+  }
+
+  void _onStateChanged() {
+    if (!mounted) return;
+    final appState = _appState!;
+    if (!appState.isInitialized) return; // still loading, wait
+
+    final target = _resolveRoute(appState);
+    Navigator.of(context).pushReplacementNamed(target);
+  }
+
+  String _resolveRoute(AppStateProvider s) {
+    if (!s.isFaceRegistered) return '/registration';
+    if (!s.isAuthenticated) return '/login';
+    return '/dashboard';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // AppRouter always renders the splash screen.
+    // The real navigation happens in _onStateChanged once initialize() fires.
+    return const _SplashScreen();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Splash Screen
+// ─────────────────────────────────────────────────────────────────────────────
 
 class _SplashScreen extends StatefulWidget {
   const _SplashScreen();
@@ -167,7 +242,9 @@ class _SplashScreenState extends State<_SplashScreen>
   }
 
   Future<void> _initializeApp() async {
-    await Future.delayed(const Duration(milliseconds: 2000));
+    // Show splash for at least 1.5s, then kick off initialize().
+    // AppRouter._onStateChanged handles navigation once done.
+    await Future.delayed(const Duration(milliseconds: 1500));
     if (mounted) {
       context.read<AppStateProvider>().initialize();
     }
