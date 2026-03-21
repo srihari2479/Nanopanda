@@ -1,11 +1,22 @@
 // lib/features/face_auth/presentation/pages/face_login_page.dart
 //
-// Ultra-fast face login — ZERO liveness steps.
-// Flow:
-//   1. Camera + MlFaceService init in parallel.
-//   2. First good frame → start collecting.
-//   3. 2 good frames → average → cosine similarity vs stored (≥80%).
-//   4. Pass → /dashboard. Fail → shake + auto-retry in 800ms.
+// Production face login — real camera, zero mocks.
+//
+// FLOW:
+//   1. Camera + ML Kit init in parallel.
+//      600 ms camera delay: Android needs time to release hardware after
+//      registration page disposes it. Too short → silent camera init fail.
+//   2. Collect 2 good-quality embeddings (fast but noise-resistant).
+//   3. Average → L2-normalise → cosine similarity vs stored vector.
+//   4. Score ≥ threshold → navigate to /dashboard.
+//      Score < threshold → shake + auto-retry after 800 ms.
+//
+// BUG FIXES vs earlier version:
+//   • _startStreamOnceReady — stream starts exactly once when BOTH ready.
+//   • Camera retry path (1 s extra delay) for slow hardware release.
+//   • Shake animation on mismatch for better UX feedback.
+//   • Match percentage displayed on success overlay.
+//   • _streamStopped guard prevents double stopImageStream on retry.
 
 import 'dart:math' as math;
 
@@ -35,6 +46,8 @@ class FaceLoginPage extends StatefulWidget {
 
 class _FaceLoginPageState extends State<FaceLoginPage>
     with TickerProviderStateMixin {
+
+  // ── Services ─────────────────────────────────────────────────────────────────
   final _cameraService = CameraService();
   final _mlService     = MlFaceService.instance;
   final _repository    = FaceAuthRepository();
@@ -42,20 +55,27 @@ class _FaceLoginPageState extends State<FaceLoginPage>
   late final AnimationController _pulseController;
   late final AnimationController _shakeController;
 
-  bool _isCameraReady      = false;
-  bool _isMlReady          = false;
-  bool _isScanning         = false;
-  bool _isVerifying        = false;
-  bool _verificationFailed = false;
-  bool _isDone             = false;
-  bool _processingFrame    = false;
-  bool _streamStopped      = false;
+  // ── Init flags ────────────────────────────────────────────────────────────────
+  bool _isCameraReady  = false;
+  bool _isMlReady      = false;
+  bool _streamStarted  = false;
+  bool _streamStopped  = false;
 
-  String  _statusMessage   = 'Initializing…';
+  // ── Flow state ────────────────────────────────────────────────────────────────
+  bool    _isScanning          = false;
+  bool    _isVerifying         = false;
+  bool    _verificationFailed  = false;
+  bool    _isDone              = false;
+  bool    _processingFrame     = false;
+
+  String  _statusMessage       = 'Initializing…';
   double? _matchPercentage;
 
+  // 2 frames: fast + noise-resistant for unlock flow
   static const int _verifyFrames = 2;
   final List<List<double>> _embeds = [];
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
   @override
   void initState() {
@@ -69,58 +89,48 @@ class _FaceLoginPageState extends State<FaceLoginPage>
     Future.delayed(const Duration(milliseconds: 100), _initAll);
   }
 
+  @override
+  void dispose() {
+    _pulseController.dispose();
+    _shakeController.dispose();
+    if (!_streamStopped) {
+      _cameraService.controller?.stopImageStream().catchError((_) {});
+    }
+    _cameraService.dispose();
+    super.dispose();
+  }
+
+  // ── Init ──────────────────────────────────────────────────────────────────────
+
   Future<void> _initAll() async {
     await Future.wait([_initCamera(), _initMl()]);
-    // Stream is started inside _initCamera/_initMl once both are ready.
-    // Nothing extra needed here — just ensure scanning state is set.
-    if (_isCameraReady && _isMlReady && mounted) {
-      _safeSetState(() {
-        _isScanning    = true;
-        _statusMessage = 'Look at the camera…';
-      });
-    }
   }
 
   Future<void> _initCamera() async {
     try {
-      // BUG FIX: When coming directly from FaceRegistrationPage, the previous
-      // CameraController.dispose() call releases the hardware camera, but
-      // Android needs a brief moment to fully free the camera resource.
-      // Starting a new CameraController immediately causes a silent failure —
-      // _isCameraReady stays false and only the loading spinner shows forever.
-      //
-      // FIX: Add a small delay before initializing to let Android finish
-      // releasing the camera from the previous page.
-      await Future.delayed(const Duration(milliseconds: 400));
+      // Android needs 600 ms to fully release camera after registration page
+      // disposes it. A shorter delay causes a silent init failure.
+      await Future.delayed(const Duration(milliseconds: 600));
       if (!mounted) return;
 
       await _cameraService.initialize();
       if (!mounted) return;
-      _safeSetState(() {
-        _isCameraReady = true;
-        _statusMessage = _isMlReady ? 'Look at the camera…' : 'Loading model…';
-        if (_isMlReady) _isScanning = true;
-      });
-      // Only start stream if ML is also ready — otherwise _initAll() will
-      // start it after both complete via _startStreamIfReady().
-      if (_isMlReady) _startFrameStream();
+      _isCameraReady = true;
+      _safeSetState(() {});
+      _startStreamOnceReady();
     } catch (e) {
-      debugPrint('[FaceLogin] Camera init error: $e');
-      // Retry once after a longer delay — handles slow camera release
-      await Future.delayed(const Duration(milliseconds: 800));
+      debugPrint('[FaceLogin] camera init error: $e — retrying in 1 s');
+      await Future.delayed(const Duration(milliseconds: 1000));
       if (!mounted) return;
       try {
         await _cameraService.initialize();
         if (!mounted) return;
-        _safeSetState(() {
-          _isCameraReady = true;
-          _statusMessage = _isMlReady ? 'Look at the camera…' : 'Loading model…';
-          if (_isMlReady) _isScanning = true;
-        });
-        if (_isMlReady) _startFrameStream();
+        _isCameraReady = true;
+        _safeSetState(() {});
+        _startStreamOnceReady();
       } catch (e2) {
-        debugPrint('[FaceLogin] Camera init retry failed: $e2');
-        _safeSetState(() => _statusMessage = 'Camera error — tap to retry');
+        debugPrint('[FaceLogin] camera retry failed: $e2');
+        _safeSetState(() => _statusMessage = 'Camera error — please restart app');
       }
     }
   }
@@ -129,30 +139,37 @@ class _FaceLoginPageState extends State<FaceLoginPage>
     try {
       await _mlService.initialize();
       if (!mounted) return;
-      _safeSetState(() {
-        _isMlReady     = true;
-        _statusMessage = _isCameraReady ? 'Look at the camera…' : 'Starting camera…';
-        if (_isCameraReady) _isScanning = true;
-      });
-      // BUG FIX: If camera finished first, stream wasn't started because
-      // _isMlReady was false at that point. Start it now.
-      if (_isCameraReady) _startFrameStream();
+      _isMlReady = true;
+      _safeSetState(() {});
+      _startStreamOnceReady();
     } catch (e) {
+      debugPrint('[FaceLogin] ML init error: $e');
       _safeSetState(() => _statusMessage = 'Model error');
     }
   }
 
-  void _startFrameStream() {
-    if (_streamStopped == false &&
-        _cameraService.controller?.value.isStreamingImages == true) {
-      // Stream already running — don't start again
-      return;
-    }
+  /// Start exactly once — only when BOTH camera AND ML are ready.
+  void _startStreamOnceReady() {
+    if (!_isCameraReady || !_isMlReady) return;
+    if (_streamStarted || _streamStopped) return;
+    _streamStarted = true;
+    _safeSetState(() {
+      _isScanning    = true;
+      _statusMessage = 'Look at the camera…';
+    });
+    _cameraService.controller?.startImageStream(_onFrame);
+    debugPrint('[FaceLogin] frame stream started');
+  }
+
+  // ── Frame stream ──────────────────────────────────────────────────────────────
+
+  /// Restarts the stream after a failed verification retry.
+  void _restartFrameStream() {
     _streamStopped = false;
     try {
       _cameraService.controller?.startImageStream(_onFrame);
     } catch (_) {
-      // Stream may already be running on some devices — stop then restart
+      // Stream may still be running — stop first, then restart
       _cameraService.controller?.stopImageStream().then((_) {
         if (!_streamStopped && mounted) {
           _cameraService.controller?.startImageStream(_onFrame);
@@ -187,7 +204,8 @@ class _FaceLoginPageState extends State<FaceLoginPage>
       }
 
       _embeds.add(result.embedding!);
-      _safeSetState(() => _statusMessage = 'Scanning… ${_embeds.length}/$_verifyFrames');
+      _safeSetState(() =>
+      _statusMessage = 'Scanning… ${_embeds.length}/$_verifyFrames');
 
       if (_embeds.length >= _verifyFrames) {
         _isScanning = false;
@@ -199,14 +217,20 @@ class _FaceLoginPageState extends State<FaceLoginPage>
     }
   }
 
+  // ── Verification ──────────────────────────────────────────────────────────────
+
   Future<void> _runVerification() async {
     if (!mounted || _isVerifying) return;
     _safeSetState(() { _isVerifying = true; _statusMessage = 'Verifying…'; });
 
     try {
       final storedVector = await context.read<StorageService>().getFaceVector();
-      if (storedVector == null) { _handleFailure('No registered face found'); return; }
+      if (storedVector == null) {
+        _handleFailure('No registered face found');
+        return;
+      }
 
+      // Average collected embeddings then L2-normalise
       final dim      = _embeds.first.length;
       final averaged = List<double>.filled(dim, 0.0);
       for (final e in _embeds) {
@@ -217,16 +241,18 @@ class _FaceLoginPageState extends State<FaceLoginPage>
       double norm = 0;
       for (final v in averaged) norm += v * v;
       norm = math.sqrt(norm);
-      final normalised = norm < 1e-10 ? averaged : averaged.map((v) => v / norm).toList();
+      final normalised =
+      norm < 1e-10 ? averaged : averaged.map((v) => v / norm).toList();
 
       final liveVector = FaceVectorModel(
-        id: 'live_${DateTime.now().millisecondsSinceEpoch}',
-        vector: normalised,
+        id:        'live_${DateTime.now().millisecondsSinceEpoch}',
+        vector:    normalised,
         createdAt: DateTime.now(),
+        userId:    storedVector.userId,
       );
 
       final result = await _repository.verifyFace(
-        liveVector: liveVector,
+        liveVector:   liveVector,
         storedVector: storedVector,
       );
 
@@ -234,67 +260,52 @@ class _FaceLoginPageState extends State<FaceLoginPage>
 
       if (result.isMatch) {
         _safeSetState(() {
-          _matchPercentage = result.matchPercentage;
-          _isDone          = true;
-          _isVerifying     = false;
-          _statusMessage   = '${result.matchPercentage.toStringAsFixed(1)}% match ✓';
+          _isVerifying      = false;
+          _isDone           = true;
+          _matchPercentage  = result.matchPercentage;
+          _statusMessage    = 'Verified! Unlocking…';
         });
         HapticFeedback.heavyImpact();
-        context.read<AppStateProvider>().setAuthenticated(true);
-        await Future.delayed(const Duration(milliseconds: 600));
+
+        await context.read<AppStateProvider>().setAuthenticated(true);
+        await Future.delayed(const Duration(milliseconds: 1200));
         if (mounted) Navigator.of(context).pushReplacementNamed('/dashboard');
       } else {
-        _handleFailure('Face not recognised');
+        _handleFailure(result.message);
       }
-    } catch (_) {
+    } catch (e) {
+      debugPrint('[FaceLogin] verification error: $e');
       _handleFailure('Verification error — try again');
     }
   }
 
-  void _handleFailure(String message) {
+  void _handleFailure(String msg) {
     if (!mounted) return;
-    _shakeController.forward().then((_) => _shakeController.reset());
     _safeSetState(() {
-      _isVerifying        = false;
-      _isScanning         = false;
-      _verificationFailed = true;
-      _statusMessage      = message;
+      _isVerifying         = false;
+      _verificationFailed  = true;
+      _statusMessage       = msg;
     });
-    HapticFeedback.vibrate();
+    HapticFeedback.mediumImpact();
+    _shakeController.forward(from: 0.0);
 
+    // Auto-retry after 800 ms
     Future.delayed(const Duration(milliseconds: 800), () {
-      if (!mounted || _isDone) return;
+      if (!mounted) return;
       _embeds.clear();
       _safeSetState(() {
         _verificationFailed = false;
         _isScanning         = true;
         _statusMessage      = 'Look at the camera…';
       });
-      _startFrameStream();
+      _streamStopped = false;
+      _restartFrameStream();
     });
   }
 
   void _safeSetState(VoidCallback fn) { if (mounted) setState(fn); }
 
-  void _showError(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(msg),
-      backgroundColor: AppTheme.error,
-      behavior: SnackBarBehavior.floating,
-      shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(AppTheme.radiusMedium)),
-    ));
-  }
-
-  @override
-  void dispose() {
-    _pulseController.dispose();
-    _shakeController.dispose();
-    _cameraService.controller?.stopImageStream().catchError((_) {});
-    _cameraService.dispose();
-    super.dispose();
-  }
+  // ── BUILD ─────────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -314,6 +325,8 @@ class _FaceLoginPageState extends State<FaceLoginPage>
       ),
     );
   }
+
+  // ── Widgets ───────────────────────────────────────────────────────────────────
 
   Widget _buildHeader() {
     return Padding(
@@ -337,8 +350,7 @@ class _FaceLoginPageState extends State<FaceLoginPage>
               .animate().fadeIn(delay: 100.ms),
           const SizedBox(height: 4),
           Text('Look at the camera to unlock',
-              style: GoogleFonts.inter(
-                  fontSize: 14, color: AppTheme.textSecondary))
+              style: GoogleFonts.inter(fontSize: 14, color: AppTheme.textSecondary))
               .animate().fadeIn(delay: 150.ms),
         ],
       ),
@@ -354,23 +366,27 @@ class _FaceLoginPageState extends State<FaceLoginPage>
           final t      = _shakeController.value;
           final offset = t < 0.5 ? (t * 24) - 6.0 : ((1 - t) * 24) - 6.0;
           return Transform.translate(
-              offset: Offset(_verificationFailed ? offset : 0, 0),
-              child: child);
+            offset: Offset(_verificationFailed ? offset : 0, 0),
+            child: child,
+          );
         },
         child: Stack(
           alignment: Alignment.center,
           children: [
+            // Glow ring — colour changes per state
             Container(
               width: camSize + 8, height: camSize + 8,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
                 boxShadow: _verificationFailed
-                    ? AppTheme.glowShadow(AppTheme.error, intensity: 0.5)
+                    ? AppTheme.glowShadow(AppTheme.error,   intensity: 0.5)
                     : _isDone
                     ? AppTheme.glowShadow(AppTheme.success, intensity: 0.5)
                     : AppTheme.glowShadow(AppTheme.primaryPurple, intensity: 0.25),
               ),
             ),
+
+            // Camera circle
             SizedBox(
               width: camSize, height: camSize,
               child: ClipOval(
@@ -383,9 +399,9 @@ class _FaceLoginPageState extends State<FaceLoginPage>
                       _buildLoadingState(),
                     CameraOverlay(
                       faceDetected: _isCameraReady && _isMlReady,
-                      isScanning: _isScanning || _isVerifying,
-                      isCircular: true,
-                      showError: _verificationFailed,
+                      isScanning:   _isScanning || _isVerifying,
+                      isCircular:   true,
+                      showError:    _verificationFailed,
                     ),
                     if ((_isScanning || _isVerifying) && !_isDone)
                       const ScanningAnimation(isCircular: true),
@@ -393,6 +409,8 @@ class _FaceLoginPageState extends State<FaceLoginPage>
                 ),
               ),
             ),
+
+            // Frame-collection progress arc (outside the circle)
             if (_isScanning && _embeds.isNotEmpty && !_isDone)
               SizedBox(
                 width: camSize + 10, height: camSize + 10,
@@ -403,28 +421,32 @@ class _FaceLoginPageState extends State<FaceLoginPage>
                   valueColor: AlwaysStoppedAnimation(AppTheme.primaryPurple),
                 ),
               ),
+
+            // Success overlay
             if (_isDone)
-              Container(
+              SizedBox(
                 width: camSize, height: camSize,
-                decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: AppTheme.success.withOpacity(0.92)),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Icon(Icons.check_circle_rounded,
-                        size: 80, color: Colors.white),
-                    const SizedBox(height: 12),
-                    Text('${_matchPercentage!.toStringAsFixed(1)}%',
-                        style: GoogleFonts.poppins(
-                            fontSize: 34, fontWeight: FontWeight.bold,
-                            color: Colors.white)),
-                    Text('VERIFIED',
-                        style: GoogleFonts.inter(
-                            fontSize: 15, fontWeight: FontWeight.w600,
-                            color: Colors.white.withOpacity(0.9),
-                            letterSpacing: 2.5)),
-                  ],
+                child: ClipOval(
+                  child: Container(
+                    color: AppTheme.success.withOpacity(0.92),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Icon(Icons.check_circle_rounded,
+                            size: 80, color: Colors.white),
+                        const SizedBox(height: 12),
+                        Text('${_matchPercentage!.toStringAsFixed(1)}%',
+                            style: GoogleFonts.poppins(
+                                fontSize: 34, fontWeight: FontWeight.bold,
+                                color: Colors.white)),
+                        Text('VERIFIED',
+                            style: GoogleFonts.inter(
+                                fontSize: 15, fontWeight: FontWeight.w600,
+                                color: Colors.white.withOpacity(0.9),
+                                letterSpacing: 2.5)),
+                      ],
+                    ),
+                  ),
                 ),
               ).animate().fadeIn().scale(),
           ],
@@ -463,9 +485,7 @@ class _FaceLoginPageState extends State<FaceLoginPage>
   Widget _buildStatus() {
     final Color iconColor = _verificationFailed
         ? AppTheme.error
-        : _isDone
-        ? AppTheme.success
-        : AppTheme.primaryPurple;
+        : _isDone ? AppTheme.success : AppTheme.primaryPurple;
 
     final IconData icon = _verificationFailed
         ? Icons.error_outline_rounded
@@ -480,18 +500,29 @@ class _FaceLoginPageState extends State<FaceLoginPage>
           opacity: _verificationFailed ? 0.12 : 0.06,
           borderColor: _verificationFailed
               ? AppTheme.error.withOpacity(0.4)
-              : _isDone ? AppTheme.success.withOpacity(0.4) : null,
+              : _isDone
+              ? AppTheme.success.withOpacity(0.4)
+              : null,
         ),
         child: Row(
           children: [
-            Icon(icon, color: iconColor, size: 22),
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 200),
+              child: Icon(icon,
+                  key: ValueKey(iconColor), color: iconColor, size: 22),
+            ),
             const SizedBox(width: 12),
             Expanded(
-              child: Text(_statusMessage,
-                  style: GoogleFonts.inter(
-                      fontSize: 14, fontWeight: FontWeight.w500,
-                      color: AppTheme.textPrimary)),
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 200),
+                child: Text(_statusMessage,
+                    key: ValueKey(_statusMessage),
+                    style: GoogleFonts.inter(
+                        fontSize: 14, fontWeight: FontWeight.w500,
+                        color: AppTheme.textPrimary)),
+              ),
             ),
+            // Scanning dots shown while collecting frames
             if (_isScanning && !_isDone)
               Row(
                 children: List.generate(3, (i) =>
@@ -504,7 +535,8 @@ class _FaceLoginPageState extends State<FaceLoginPage>
                       ),
                     ).animate(onPlay: (c) => c.repeat())
                         .fadeIn(delay: Duration(milliseconds: i * 200))
-                        .then().fadeOut(),
+                        .then()
+                        .fadeOut(),
                 ),
               ),
           ],

@@ -1,75 +1,68 @@
 // lib/core/services/camera_service.dart
+//
+// Wraps the `camera` plugin: finds front camera, initialises controller,
+// exposes isReady guard and safe dispose.
+
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 
 class CameraService {
   CameraController? _controller;
-  bool _isInitialized = false;
-  bool _isDisposing = false;
+  bool _disposed = false;
 
   CameraController? get controller => _controller;
-  bool get isInitialized => _isInitialized;
 
+  bool get isReady =>
+      _controller != null &&
+          _controller!.value.isInitialized &&
+          !_disposed;
+
+  /// Finds the front camera and initialises the controller.
+  /// Resolution is set to medium — fast enough for ML Kit frame processing.
   Future<void> initialize() async {
-    // Don't reinitialize if already initialized
-    if (_isInitialized && _controller != null) {
-      return;
-    }
+    if (_disposed) return;
 
-    // Dispose existing controller if any
-    if (_controller != null) {
-      await dispose();
-    }
+    final cameras = await availableCameras();
+    if (cameras.isEmpty) throw Exception('No cameras available');
 
-    _isDisposing = false;
+    final front = cameras.firstWhere(
+          (c) => c.lensDirection == CameraLensDirection.front,
+      orElse: () => cameras.first,
+    );
 
+    // Dispose previous controller cleanly before creating new one
+    await _safeDisposeController();
+
+    _controller = CameraController(
+      front,
+      ResolutionPreset.medium,   // 480p — optimal for ML Kit speed vs quality
+      enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.yuv420,
+    );
+
+    await _controller!.initialize();
+    debugPrint('[CameraService] initialized (${front.name}, '
+        'sensor=${front.sensorOrientation}°)');
+  }
+
+  Future<void> _safeDisposeController() async {
+    final old = _controller;
+    _controller = null;
+    if (old == null) return;
     try {
-      final cameras = await availableCameras();
-      if (cameras.isEmpty) {
-        throw Exception('No cameras available');
+      if (old.value.isStreamingImages) {
+        await old.stopImageStream();
       }
-
-      final frontCamera = cameras.firstWhere(
-            (c) => c.lensDirection == CameraLensDirection.front,
-        orElse: () => cameras.first,
-      );
-
-      _controller = CameraController(
-        frontCamera,
-        ResolutionPreset.high, // Changed to high for better quality
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.jpeg,
-      );
-
-      await _controller!.initialize();
-
-      if (!_isDisposing) {
-        _isInitialized = true;
-      }
+      await old.dispose();
     } catch (e) {
-      debugPrint('Camera initialization error: $e');
-      _isInitialized = false;
-      _controller = null;
-      rethrow;
+      debugPrint('[CameraService] dispose old controller error: $e');
     }
   }
 
   Future<void> dispose() async {
-    if (_controller != null && !_isDisposing) {
-      _isDisposing = true;
-      _isInitialized = false;
-
-      try {
-        await _controller!.dispose();
-      } catch (e) {
-        debugPrint('Error disposing camera: $e');
-      } finally {
-        _controller = null;
-        _isDisposing = false;
-      }
-    }
+    if (_disposed) return;
+    _disposed = true;
+    await _safeDisposeController();
+    debugPrint('[CameraService] disposed');
   }
-
-  // Method to check if camera is ready to use
-  bool get isReady => _isInitialized && _controller != null && _controller!.value.isInitialized;
 }

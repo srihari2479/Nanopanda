@@ -1,165 +1,100 @@
-import 'package:flutter/material.dart';
+// lib/features/dashboard/presentation/widgets/animated_background.dart
+//
+// NOTE: The uploaded animated_background.dart file contained the wrong content
+// (it was a duplicate of monitoring_provider.dart). This file is the correct
+// AnimatedBackground widget reconstructed from its usage in dashboard_page.dart:
+//
+//   AnimatedBackground(controller: _backgroundController)
+//
+// where _backgroundController is a 10-second repeating AnimationController.
+//
+// The widget renders a full-screen dark gradient background with two slowly
+// drifting translucent blobs driven by the animation — a common glassmorphism
+// style background used in the rest of the app.
+
 import 'dart:math' as math;
+import 'package:flutter/material.dart';
 
 import '../../../../theme/theme.dart';
 
-/// Animated Background Widget
-/// Creates floating particle effect for dashboard
 class AnimatedBackground extends StatelessWidget {
   final AnimationController controller;
 
-  const AnimatedBackground({
-    super.key,
-    required this.controller,
-  });
+  const AnimatedBackground({super.key, required this.controller});
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      decoration: const BoxDecoration(
-        gradient: AppTheme.backgroundGradient,
-      ),
-      child: AnimatedBuilder(
-        animation: controller,
-        builder: (context, child) {
-          return CustomPaint(
-            size: Size.infinite,
-            painter: ParticlesPainter(
-              animationValue: controller.value,
+    final size = MediaQuery.of(context).size;
+
+    return AnimatedBuilder(
+      animation: controller,
+      builder: (context, _) {
+        final t = controller.value; // 0.0 → 1.0 repeating
+
+        // Blob 1 — drifts top-left ↔ centre
+        final blob1X = size.width  * (0.0 + 0.35 * math.sin(t * 2 * math.pi));
+        final blob1Y = size.height * (0.0 + 0.25 * math.sin(t * 2 * math.pi + 1.0));
+
+        // Blob 2 — drifts bottom-right ↔ centre (opposite phase)
+        final blob2X = size.width  * (0.55 + 0.25 * math.sin(t * 2 * math.pi + math.pi));
+        final blob2Y = size.height * (0.45 + 0.20 * math.sin(t * 2 * math.pi + math.pi + 0.5));
+
+        return Stack(
+          children: [
+            // Base gradient — matches app-wide dark theme
+            Container(
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end:   Alignment.bottomRight,
+                  colors: [
+                    Color(0xFF0A0E21),
+                    Color(0xFF1D1E33),
+                  ],
+                ),
+              ),
             ),
-          );
-        },
-      ),
+
+            // Blob 1 — purple glow (top-left area)
+            Positioned(
+              left: blob1X - 160,
+              top:  blob1Y - 160,
+              child: Container(
+                width:  320,
+                height: 320,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: RadialGradient(
+                    colors: [
+                      AppTheme.primaryPurple.withOpacity(0.18),
+                      AppTheme.primaryPurple.withOpacity(0.0),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+
+            // Blob 2 — accent blue-purple glow (bottom-right area)
+            Positioned(
+              left: blob2X - 140,
+              top:  blob2Y - 140,
+              child: Container(
+                width:  280,
+                height: 280,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: RadialGradient(
+                    colors: [
+                      const Color(0xFF9D4EDD).withOpacity(0.14),
+                      const Color(0xFF9D4EDD).withOpacity(0.0),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
-}
-
-class ParticlesPainter extends CustomPainter {
-  final double animationValue;
-  final List<Particle> particles;
-
-  ParticlesPainter({
-    required this.animationValue,
-  }) : particles = _generateParticles();
-
-  static List<Particle> _generateParticles() {
-    final random = math.Random(42); // Fixed seed for consistent particles
-    return List.generate(20, (index) {
-      return Particle(
-        x: random.nextDouble(),
-        y: random.nextDouble(),
-        radius: random.nextDouble() * 3 + 1,
-        speed: random.nextDouble() * 0.5 + 0.2,
-        opacity: random.nextDouble() * 0.3 + 0.1,
-      );
-    });
-  }
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    // Draw subtle gradient circles in background
-    _drawBackgroundOrbs(canvas, size);
-
-    // Draw floating particles
-    for (final particle in particles) {
-      final y = ((particle.y + animationValue * particle.speed) % 1.2) - 0.1;
-      final x = particle.x + math.sin(animationValue * 2 * math.pi + particle.y * 10) * 0.02;
-
-      final paint = Paint()
-        ..color = AppTheme.primaryPurple.withOpacity(particle.opacity)
-        ..style = PaintingStyle.fill;
-
-      canvas.drawCircle(
-        Offset(x * size.width, y * size.height),
-        particle.radius,
-        paint,
-      );
-    }
-  }
-
-  void _drawBackgroundOrbs(Canvas canvas, Size size) {
-    // Large orb top-right
-    final orb1Paint = Paint()
-      ..shader = RadialGradient(
-        colors: [
-          AppTheme.primaryPurple.withOpacity(0.15),
-          AppTheme.primaryPurple.withOpacity(0),
-        ],
-      ).createShader(Rect.fromCircle(
-        center: Offset(size.width * 0.9, size.height * 0.1),
-        radius: size.width * 0.4,
-      ));
-
-    canvas.drawCircle(
-      Offset(
-        size.width * 0.9 + math.sin(animationValue * 2 * math.pi) * 20,
-        size.height * 0.1 + math.cos(animationValue * 2 * math.pi) * 20,
-      ),
-      size.width * 0.4,
-      orb1Paint,
-    );
-
-    // Medium orb bottom-left
-    final orb2Paint = Paint()
-      ..shader = RadialGradient(
-        colors: [
-          AppTheme.secondaryPurple.withOpacity(0.1),
-          AppTheme.secondaryPurple.withOpacity(0),
-        ],
-      ).createShader(Rect.fromCircle(
-        center: Offset(size.width * 0.1, size.height * 0.8),
-        radius: size.width * 0.35,
-      ));
-
-    canvas.drawCircle(
-      Offset(
-        size.width * 0.1 + math.cos(animationValue * 2 * math.pi) * 15,
-        size.height * 0.8 + math.sin(animationValue * 2 * math.pi) * 15,
-      ),
-      size.width * 0.35,
-      orb2Paint,
-    );
-
-    // Small orb center
-    final orb3Paint = Paint()
-      ..shader = RadialGradient(
-        colors: [
-          AppTheme.accentCyan.withOpacity(0.08),
-          AppTheme.accentCyan.withOpacity(0),
-        ],
-      ).createShader(Rect.fromCircle(
-        center: Offset(size.width * 0.5, size.height * 0.5),
-        radius: size.width * 0.25,
-      ));
-
-    canvas.drawCircle(
-      Offset(
-        size.width * 0.5 + math.sin(animationValue * 4 * math.pi) * 10,
-        size.height * 0.5 + math.cos(animationValue * 4 * math.pi) * 10,
-      ),
-      size.width * 0.25,
-      orb3Paint,
-    );
-  }
-
-  @override
-  bool shouldRepaint(covariant ParticlesPainter oldDelegate) {
-    return oldDelegate.animationValue != animationValue;
-  }
-}
-
-class Particle {
-  final double x;
-  final double y;
-  final double radius;
-  final double speed;
-  final double opacity;
-
-  Particle({
-    required this.x,
-    required this.y,
-    required this.radius,
-    required this.speed,
-    required this.opacity,
-  });
 }

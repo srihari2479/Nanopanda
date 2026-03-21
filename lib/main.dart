@@ -1,11 +1,22 @@
+// lib/main.dart
+//
+// Added:
+//   • navigatorKey — GlobalKey<NavigatorState> passed to both MaterialApp
+//     and MonitoringService.navigatorKey so the polling service can push
+//     /face-overlay from the background without a BuildContext.
+//   • '/face-overlay' route — FaceOverlayPage, full-screen, no animation
+//     (appears instantly to feel like a system overlay).
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:provider/provider.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import 'theme/theme.dart';
 import 'core/services/storage_service.dart';
 import 'core/services/ml_face_service.dart';
+import 'core/services/monitoring_service.dart';
 import 'core/providers/app_state_provider.dart';
 import 'core/providers/monitoring_provider.dart';
 import 'features/face_auth/presentation/pages/face_registration_page.dart';
@@ -16,9 +27,43 @@ import 'features/emotion/presentation/pages/emotion_detection_page.dart';
 import 'features/emotion/presentation/pages/emotion_result_page.dart';
 import 'features/monitoring/presentation/pages/app_selection_page.dart';
 import 'features/monitoring/presentation/pages/logs_page.dart';
+import 'features/monitoring/presentation/pages/face_overlay_page.dart';
+
+// ── Global navigator key ──────────────────────────────────────────────────────
+// MonitoringService uses this to push /face-overlay from polling context.
+final _navigatorKey = GlobalKey<NavigatorState>();
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // FIX 1: initCommunicationPort() before runApp()
+  FlutterForegroundTask.initCommunicationPort();
+
+  // FIX 2: init() before runApp() so config is ready before providers build
+  FlutterForegroundTask.init(
+    androidNotificationOptions: AndroidNotificationOptions(
+      channelId:          'nanopanda_monitoring',
+      channelName:        'App Protection',
+      channelDescription: 'Nanopanda is protecting your apps',
+      channelImportance:  NotificationChannelImportance.LOW,
+      priority:           NotificationPriority.LOW,
+    ),
+    iosNotificationOptions: const IOSNotificationOptions(
+      showNotification: false,
+      playSound:        false,
+    ),
+    foregroundTaskOptions: ForegroundTaskOptions(
+      eventAction:                ForegroundTaskEventAction.repeat(5000),
+      autoRunOnBoot:              true,
+      autoRunOnMyPackageReplaced: true,
+      allowWakeLock:              true,
+      allowWifiLock:              false,
+    ),
+  );
+
+  // Register navigatorKey with MonitoringService BEFORE runApp so it's
+  // available as soon as polling might fire.
+  MonitoringService.navigatorKey = _navigatorKey;
 
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
@@ -27,9 +72,9 @@ void main() async {
 
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
-      statusBarColor: Colors.transparent,
-      statusBarIconBrightness: Brightness.light,
-      systemNavigationBarColor: Color(0xFF0A0E21),
+      statusBarColor:                    Colors.transparent,
+      statusBarIconBrightness:           Brightness.light,
+      systemNavigationBarColor:          Color(0xFF0A0E21),
       systemNavigationBarIconBrightness: Brightness.light,
     ),
   );
@@ -43,7 +88,9 @@ void main() async {
     MultiProvider(
       providers: [
         Provider<StorageService>.value(value: storageService),
-        ChangeNotifierProvider(create: (_) => AppStateProvider(storageService)),
+        ChangeNotifierProvider(
+          create: (_) => AppStateProvider(storageService),
+        ),
         ChangeNotifierProvider(
           create: (_) => MonitoringProvider(storageService),
         ),
@@ -59,59 +106,70 @@ class FaceGuardApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Nanopanda',
+      title:                      'Nanopanda',
       debugShowCheckedModeBanner: false,
-      theme: AppTheme.darkTheme,
-      // BUG FIX: Do NOT wrap MaterialApp in Consumer and change home: based
-      // on state. MaterialApp.home is only read ONCE on the first build.
-      // Any subsequent rebuild of MaterialApp.home is silently ignored by
-      // Flutter's Navigator — the screen never changes.
-      //
-      // CORRECT PATTERN: home: is always the static AppRouter widget.
-      // AppRouter listens to AppStateProvider and imperatively calls
-      // Navigator.pushReplacementNamed() so the correct screen always shows.
-      home: const AppRouter(),
-      onGenerateRoute: _generateRoute,
+      theme:                      AppTheme.darkTheme,
+      navigatorKey:               _navigatorKey,   // ← key registered here
+      home:                       const AppRouter(),
+      onGenerateRoute:            _generateRoute,
     );
   }
 
   static Route<dynamic>? _generateRoute(RouteSettings settings) {
     switch (settings.name) {
       case '/registration':
-        return _buildPageRoute(const FaceRegistrationPage());
+        return _page(const FaceRegistrationPage());
       case '/login':
-        return _buildPageRoute(const FaceLoginPage());
+        return _page(const FaceLoginPage());
       case '/dashboard':
-        return _buildPageRoute(const DashboardPage());
+        return _page(const DashboardPage());
       case '/settings':
-        return _buildPageRoute(const SettingsPage());
+        return _page(const SettingsPage());
       case '/emotion-detection':
-        return _buildPageRoute(const EmotionDetectionPage());
+        return _page(const EmotionDetectionPage());
       case '/emotion-result':
         final emotion = settings.arguments as String? ?? 'neutral';
-        return _buildPageRoute(EmotionResultPage(emotion: emotion));
+        return _page(EmotionResultPage(emotion: emotion));
       case '/app-selection':
-        return _buildPageRoute(const AppSelectionPage());
+        return _page(const AppSelectionPage());
       case '/logs':
-        return _buildPageRoute(const LogsPage());
+        return _page(const LogsPage());
+
+    // ── Face overlay — instant (no animation) ─────────────────────────────
+      case '/face-overlay':
+        final args = settings.arguments as Map<String, dynamic>? ?? {};
+        return PageRouteBuilder(
+          pageBuilder: (_, __, ___) => FaceOverlayPage(
+            packageName: args['packageName'] as String? ?? '',
+            appName:     args['appName']     as String? ?? 'Unknown App',
+            detectedAt:  args['detectedAt'] != null
+                ? DateTime.parse(args['detectedAt'] as String)
+                : DateTime.now(),
+          ),
+          transitionDuration: Duration.zero,
+          reverseTransitionDuration: Duration.zero,
+          transitionsBuilder: (_, __, ___, child) => child,
+          fullscreenDialog: true,
+        );
+
       default:
         return null;
     }
   }
 
-  static PageRouteBuilder _buildPageRoute(Widget page) {
+  static PageRouteBuilder _page(Widget page) {
     return PageRouteBuilder(
-      pageBuilder: (context, animation, secondaryAnimation) => page,
-      transitionsBuilder: (context, animation, secondaryAnimation, child) {
+      pageBuilder: (_, animation, __) => page,
+      transitionsBuilder: (_, animation, __, child) {
         return FadeTransition(
           opacity: animation,
           child: SlideTransition(
             position: Tween<Offset>(
               begin: const Offset(0.05, 0),
-              end: Offset.zero,
+              end:   Offset.zero,
             ).animate(CurvedAnimation(
               parent: animation,
-              curve: Curves.easeOutCubic,
+              curve:  Curves.easeOutCubic,
             )),
             child: child,
           ),
@@ -122,33 +180,10 @@ class FaceGuardApp extends StatelessWidget {
   }
 }
 
-/// AppRouter
-///
-/// BUG FIX — Why this widget exists:
-/// The original code wrapped MaterialApp in a Consumer<AppStateProvider> and
-/// changed `home:` based on state. This does NOT work because Flutter's
-/// Navigator only reads `home:` once on the very first build. After that,
-/// rebuilding MaterialApp with a different `home:` is completely ignored —
-/// the navigator stack stays unchanged and the screen never switches.
-///
-/// CORRECT PATTERN used here:
-///   1. AppRouter is always the static home: of MaterialApp.
-///   2. It subscribes to AppStateProvider via addListener.
-///   3. When state changes it calls Navigator.pushReplacementNamed() which
-///      correctly replaces whatever is on the stack.
-///
-/// Screen decision logic:
-///
-///   Fresh install (friend's new phone):
-///     → splash → initialize() finds no face vector
-///     → isFaceRegistered=false → /registration  ✅
-///
-///   Returning user (cold start):
-///     → splash → initialize() finds face vector
-///     → isFaceRegistered=true, isAuthenticated=false → /login  ✅
-///
-///   Authenticated user (resume from recents, process still alive):
-///     → isAuthenticated stays true in memory → /dashboard  ✅
+// ─────────────────────────────────────────────────────────────────────────────
+// AppRouter
+// ─────────────────────────────────────────────────────────────────────────────
+
 class AppRouter extends StatefulWidget {
   const AppRouter({super.key});
 
@@ -162,8 +197,6 @@ class _AppRouterState extends State<AppRouter> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    // didChangeDependencies is the correct place to read Provider
-    // (not initState, where Provider is not yet available).
     final appState = context.read<AppStateProvider>();
     if (_appState != appState) {
       _appState?.removeListener(_onStateChanged);
@@ -180,25 +213,19 @@ class _AppRouterState extends State<AppRouter> {
 
   void _onStateChanged() {
     if (!mounted) return;
-    final appState = _appState!;
-    if (!appState.isInitialized) return; // still loading, wait
-
-    final target = _resolveRoute(appState);
-    Navigator.of(context).pushReplacementNamed(target);
+    final s = _appState!;
+    if (!s.isInitialized) return;
+    Navigator.of(context).pushReplacementNamed(_resolveRoute(s));
   }
 
   String _resolveRoute(AppStateProvider s) {
     if (!s.isFaceRegistered) return '/registration';
-    if (!s.isAuthenticated) return '/login';
+    if (!s.isAuthenticated)  return '/login';
     return '/dashboard';
   }
 
   @override
-  Widget build(BuildContext context) {
-    // AppRouter always renders the splash screen.
-    // The real navigation happens in _onStateChanged once initialize() fires.
-    return const _SplashScreen();
-  }
+  Widget build(BuildContext context) => const _SplashScreen();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -215,35 +242,30 @@ class _SplashScreen extends StatefulWidget {
 class _SplashScreenState extends State<_SplashScreen>
     with SingleTickerProviderStateMixin {
   late AnimationController _controller;
-  late Animation<double> _scaleAnimation;
-  late Animation<double> _opacityAnimation;
+  late Animation<double>   _scale;
+  late Animation<double>   _opacity;
 
   @override
   void initState() {
     super.initState();
     _controller = AnimationController(
-      vsync: this,
+      vsync:    this,
       duration: const Duration(milliseconds: 1500),
     );
-
-    _scaleAnimation = Tween<double>(begin: 0.5, end: 1.0).animate(
+    _scale = Tween<double>(begin: 0.5, end: 1.0).animate(
       CurvedAnimation(parent: _controller, curve: Curves.elasticOut),
     );
-
-    _opacityAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+    _opacity = Tween<double>(begin: 0.0, end: 1.0).animate(
       CurvedAnimation(
         parent: _controller,
-        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
+        curve:  const Interval(0.0, 0.5, curve: Curves.easeOut),
       ),
     );
-
     _controller.forward();
-    _initializeApp();
+    _init();
   }
 
-  Future<void> _initializeApp() async {
-    // Show splash for at least 1.5s, then kick off initialize().
-    // AppRouter._onStateChanged handles navigation once done.
+  Future<void> _init() async {
     await Future.delayed(const Duration(milliseconds: 1500));
     if (mounted) {
       context.read<AppStateProvider>().initialize();
@@ -262,67 +284,65 @@ class _SplashScreenState extends State<_SplashScreen>
       body: Container(
         decoration: const BoxDecoration(
           gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
+            begin:  Alignment.topLeft,
+            end:    Alignment.bottomRight,
             colors: [Color(0xFF0A0E21), Color(0xFF1D1E33)],
           ),
         ),
         child: Center(
           child: AnimatedBuilder(
             animation: _controller,
-            builder: (context, child) {
-              return Opacity(
-                opacity: _opacityAnimation.value,
-                child: Transform.scale(
-                  scale: _scaleAnimation.value,
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Container(
-                        width: 120,
-                        height: 120,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          gradient: const LinearGradient(
-                            colors: [Color(0xFF6C63FF), Color(0xFF9D4EDD)],
+            builder: (_, __) => Opacity(
+              opacity: _opacity.value,
+              child: Transform.scale(
+                scale: _scale.value,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width:  120,
+                      height: 120,
+                      decoration: BoxDecoration(
+                        shape:    BoxShape.circle,
+                        gradient: const LinearGradient(
+                          colors: [Color(0xFF6C63FF), Color(0xFF9D4EDD)],
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color:        const Color(0xFF6C63FF).withOpacity(0.5),
+                            blurRadius:   30,
+                            spreadRadius: 5,
                           ),
-                          boxShadow: [
-                            BoxShadow(
-                              color: const Color(0xFF6C63FF).withOpacity(0.5),
-                              blurRadius: 30,
-                              spreadRadius: 5,
-                            ),
-                          ],
-                        ),
-                        child: const Icon(
-                          Icons.face_retouching_natural,
-                          size: 60,
-                          color: Colors.white,
-                        ),
+                        ],
                       ),
-                      const SizedBox(height: 24),
-                      Text(
-                        'Nanopanda',
-                        style: GoogleFonts.poppins(
-                          fontSize: 32,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
-                        ),
+                      child: const Icon(
+                        Icons.face_retouching_natural,
+                        size:  60,
+                        color: Colors.white,
                       ),
-                      const SizedBox(height: 8),
-                      Text(
-                        'Secure • Smart • Simple',
-                        style: GoogleFonts.inter(
-                          fontSize: 14,
-                          color: Colors.white60,
-                          letterSpacing: 2,
-                        ),
+                    ),
+                    const SizedBox(height: 24),
+                    Text(
+                      'Nanopanda',
+                      style: GoogleFonts.poppins(
+                        fontSize:   32,
+                        fontWeight: FontWeight.bold,
+                        color:      Colors.white,
                       ),
-                    ],
-                  ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Secure • Smart • Simple',
+                      style: GoogleFonts.inter(
+                        fontSize:      14,
+                        color:         Colors.white60,
+                        letterSpacing: 2,
+                      ),
+                    ),
+                  ],
                 ),
-              );
-            },
+              ),
+            ),
           ),
         ),
       ),

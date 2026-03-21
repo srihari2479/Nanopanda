@@ -1,3 +1,11 @@
+// lib/features/dashboard/presentation/widgets/dashboard_card.dart
+//
+// Dashboard Action Card — glassmorphic card with gradient background
+// and press-scale animation.
+//
+// No changes from uploaded version. Included here as a complete file
+// alongside the other dashboard files for convenience.
+
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
@@ -6,12 +14,12 @@ import '../../../../theme/theme.dart';
 /// Dashboard Action Card
 /// Glassmorphic card with gradient background and animations
 class DashboardCard extends StatefulWidget {
-  final String title;
-  final String subtitle;
-  final IconData icon;
-  final List<Color> gradientColors;
+  final String       title;
+  final String       subtitle;
+  final IconData     icon;
+  final List<Color>  gradientColors;
   final VoidCallback onTap;
-  final bool isLarge;
+  final bool         isLarge;
 
   const DashboardCard({
     super.key,
@@ -30,14 +38,14 @@ class DashboardCard extends StatefulWidget {
 class _DashboardCardState extends State<DashboardCard>
     with SingleTickerProviderStateMixin {
   late AnimationController _controller;
-  late Animation<double> _scaleAnimation;
+  late Animation<double>   _scaleAnimation;
   bool _isPressed = false;
 
   @override
   void initState() {
     super.initState();
     _controller = AnimationController(
-      vsync: this,
+      vsync:    this,
       duration: const Duration(milliseconds: 150),
     );
     _scaleAnimation = Tween<double>(begin: 1.0, end: 0.97).animate(
@@ -70,8 +78,8 @@ class _DashboardCardState extends State<DashboardCard>
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
-      onTapDown: _handleTapDown,
-      onTapUp: _handleTapUp,
+      onTapDown:   _handleTapDown,
+      onTapUp:     _handleTapUp,
       onTapCancel: _handleTapCancel,
       child: AnimatedBuilder(
         animation: _scaleAnimation,
@@ -87,10 +95,11 @@ class _DashboardCardState extends State<DashboardCard>
             borderRadius: BorderRadius.circular(AppTheme.radiusLarge),
             boxShadow: [
               BoxShadow(
-                color: widget.gradientColors.first.withOpacity(_isPressed ? 0.6 : 0.4),
-                blurRadius: _isPressed ? 25 : 20,
+                color:       widget.gradientColors.first
+                    .withOpacity(_isPressed ? 0.6 : 0.4),
+                blurRadius:  _isPressed ? 25 : 20,
                 spreadRadius: _isPressed ? 2 : 0,
-                offset: const Offset(0, 8),
+                offset:      const Offset(0, 8),
               ),
             ],
           ),
@@ -103,7 +112,7 @@ class _DashboardCardState extends State<DashboardCard>
                   decoration: BoxDecoration(
                     gradient: LinearGradient(
                       begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
+                      end:   Alignment.bottomRight,
                       colors: widget.gradientColors,
                     ),
                   ),
@@ -115,7 +124,7 @@ class _DashboardCardState extends State<DashboardCard>
                     decoration: BoxDecoration(
                       gradient: LinearGradient(
                         begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
+                        end:   Alignment.bottomRight,
                         colors: [
                           Colors.white.withOpacity(0.15),
                           Colors.white.withOpacity(0.05),
@@ -128,9 +137,9 @@ class _DashboardCardState extends State<DashboardCard>
                 // Decorative circles
                 Positioned(
                   right: -30,
-                  top: -30,
+                  top:   -30,
                   child: Container(
-                    width: 120,
+                    width:  120,
                     height: 120,
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
@@ -139,10 +148,10 @@ class _DashboardCardState extends State<DashboardCard>
                   ),
                 ),
                 Positioned(
-                  right: 20,
+                  right:  20,
                   bottom: -40,
                   child: Container(
-                    width: 80,
+                    width:  80,
                     height: 80,
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
@@ -156,15 +165,16 @@ class _DashboardCardState extends State<DashboardCard>
                   padding: const EdgeInsets.all(AppTheme.spacingM),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisAlignment: MainAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.max,
+                    mainAxisAlignment:  MainAxisAlignment.start,
+                    mainAxisSize:       MainAxisSize.max,
                     children: [
                       // Icon container
                       Container(
                         padding: const EdgeInsets.all(12),
                         decoration: BoxDecoration(
                           color: Colors.white.withOpacity(0.2),
-                          borderRadius: BorderRadius.circular(AppTheme.radiusMedium),
+                          borderRadius: BorderRadius.circular(
+                              AppTheme.radiusMedium),
                         ),
                         child: Icon(
                           widget.icon,
@@ -180,24 +190,24 @@ class _DashboardCardState extends State<DashboardCard>
                         padding: const EdgeInsets.only(right: 44),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisSize: MainAxisSize.min,
+                          mainAxisSize:       MainAxisSize.min,
                           children: [
                             Text(
                               widget.title,
                               style: GoogleFonts.poppins(
-                                fontSize: widget.isLarge ? 20 : 16,
+                                fontSize:   widget.isLarge ? 20 : 16,
                                 fontWeight: FontWeight.w600,
-                                color: Colors.white,
+                                color:      Colors.white,
                               ),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
+                              maxLines:  1,
+                              overflow:  TextOverflow.ellipsis,
                             ),
                             const SizedBox(height: 2),
                             Text(
                               widget.subtitle,
                               style: GoogleFonts.inter(
                                 fontSize: widget.isLarge ? 14 : 12,
-                                color: Colors.white.withOpacity(0.8),
+                                color:    Colors.white.withOpacity(0.8),
                               ),
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
@@ -211,7 +221,7 @@ class _DashboardCardState extends State<DashboardCard>
 
                 // Arrow indicator
                 Positioned(
-                  right: AppTheme.spacingM,
+                  right:  AppTheme.spacingM,
                   bottom: AppTheme.spacingM,
                   child: Container(
                     padding: const EdgeInsets.all(8),
@@ -222,7 +232,7 @@ class _DashboardCardState extends State<DashboardCard>
                     child: const Icon(
                       Icons.arrow_forward,
                       color: Colors.white,
-                      size: 18,
+                      size:  18,
                     ),
                   ),
                 ),

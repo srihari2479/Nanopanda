@@ -21,7 +21,15 @@ android {
     defaultConfig {
         applicationId = "com.example.nanospark"
         minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
+
+        // FIXED: Hardcoded to 34 instead of flutter.targetSdkVersion (which = 36).
+        // Android 35/36 enforces BAL_BLOCK (Background Activity Launch) — any
+        // startActivity() from a FOREGROUND_SERVICE state is blocked completely,
+        // including PendingIntents and full-screen notifications.
+        // targetSdk = 34 exempts us from this restriction while the app still
+        // runs fine on Android 14/15/16 devices.
+        targetSdk = 34
+
         versionCode = flutter.versionCode
         versionName = flutter.versionName
 

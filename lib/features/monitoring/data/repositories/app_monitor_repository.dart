@@ -1,4 +1,17 @@
 // lib/features/monitoring/data/repositories/app_monitor_repository.dart
+//
+// FIX: Removed dead null-checks that the analyzer correctly flagged as
+// always-false conditions (warnings at lines 65 and 98 in the original):
+//
+//   Line 65: `if (appName == null) continue;`
+//     app.name is typed String (non-nullable) in the installed_apps package.
+//     The null check was a leftover from an older API version. Removed.
+//
+//   Line 98: `app.name ?? packageName`
+//     Same — app.name is non-nullable, so the fallback was never executed.
+//     Simplified to just app.name.
+//
+// No logic change — behavior is identical; warnings are gone.
 
 import 'dart:io';
 import 'package:installed_apps/installed_apps.dart';
@@ -14,7 +27,6 @@ class AppMonitorRepository {
 
   static const _ownPackage    = 'com.example.nanospark';
   static const _minAppNameLen = 2;
-  // Refresh cache if older than 24 hours or on manual refresh
   static const _cacheMaxAge   = Duration(hours: 24);
 
   static const _blockedPrefixes = [
@@ -60,9 +72,10 @@ class AppMonitorRepository {
 
       final apps = <AppInfoModel>[];
       for (final app in raw) {
+        // FIX: app.name is non-nullable in installed_apps — removed dead
+        // `if (appName == null) continue;` check that caused a warning.
         final appName = app.name;
         if (app.packageName == _ownPackage)  continue;
-        if (appName == null)                 continue;
         if (appName.length < _minAppNameLen) continue;
         if (_isBlocked(app.packageName))     continue;
 
@@ -94,8 +107,10 @@ class AppMonitorRepository {
     try {
       final AppInfo? app = await InstalledApps.getAppInfo(packageName, null);
       if (app == null) return null;
+      // FIX: app.name is non-nullable — removed dead `?? packageName` fallback
+      // that caused an "operand can never be executed" warning.
       return AppInfoModel(
-        name:        app.name ?? packageName,
+        name:        app.name,
         packageName: app.packageName,
         icon:        app.icon,
         isSystemApp: false,

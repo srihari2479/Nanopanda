@@ -1,16 +1,12 @@
 // lib/features/face_auth/data/repositories/face_auth_repository.dart
 //
-// Production face-auth repository — fully fixed.
+// Production face-auth repository.
 //
-// ── Changes vs original ───────────────────────────────────────────────────────
-//  • registerFaceFromFrames: accepts _targetFrames (8) instead of 5 — matches
-//    the updated registration page for a more robust stored template.
-//  • verifyFace: threshold now sourced from AppConstants (80%).
-//    The matchPercentage formula is clamped to [0, 100] to prevent edge-case
-//    values outside range from slipping through.
-//  • L2 normalisation in registerFaceFromFrames: norm=0 guard added (avoids
-//    division-by-zero when averaging produces an all-zero vector).
-//  • All debug prints prefixed consistently for easy log filtering.
+// Threshold change for FaceNet-512 int-quantized (128-d output):
+//   MlFaceService.matchThreshold  = 0.50  (cosine similarity)
+//   matchPercentage formula        = (cosine + 1) / 2 * 100
+//   0.50 cosine → 75 % display
+//   AppConstants.faceMatchThreshold must be 0.75  ← update constants.dart
 
 import 'dart:math' as math;
 
@@ -21,13 +17,61 @@ import '../../../../core/services/ml_face_service.dart';
 import '../../../../core/utils/constants.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Result types
+// FaceVerificationStatus
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum FaceVerificationStatus {
+  success,
+  mismatch,
+  noFaceDetected,
+  unknownError,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FaceVerificationResult
+// ─────────────────────────────────────────────────────────────────────────────
+
+class FaceVerificationResult {
+  final bool                   isMatch;
+  final double                 matchPercentage;
+  final FaceVerificationStatus status;
+  final String                 message;
+
+  const FaceVerificationResult._({
+    required this.isMatch,
+    required this.matchPercentage,
+    required this.status,
+    required this.message,
+  });
+
+  factory FaceVerificationResult.success(double score) =>
+      FaceVerificationResult._(
+        isMatch:         true,
+        matchPercentage: score,
+        status:          FaceVerificationStatus.success,
+        message:         'Face verified (${score.toStringAsFixed(1)}%)',
+      );
+
+  factory FaceVerificationResult.failure(
+      String message,
+      FaceVerificationStatus status,
+      ) =>
+      FaceVerificationResult._(
+        isMatch:         false,
+        matchPercentage: 0.0,
+        status:          status,
+        message:         message,
+      );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FaceRegistrationResult
 // ─────────────────────────────────────────────────────────────────────────────
 
 class FaceRegistrationResult {
-  final bool isSuccess;
-  final String? userId;
-  final String message;
+  final bool            isSuccess;
+  final String?         userId;
+  final String          message;
   final FaceVectorModel? faceVector;
 
   FaceRegistrationResult._({
@@ -38,13 +82,13 @@ class FaceRegistrationResult {
   });
 
   factory FaceRegistrationResult.success({
-    required String userId,
+    required String         userId,
     required FaceVectorModel faceVector,
   }) =>
       FaceRegistrationResult._(
-        isSuccess: true,
-        userId: userId,
-        message: 'Face registered successfully',
+        isSuccess:  true,
+        userId:     userId,
+        message:    'Face registered successfully',
         faceVector: faceVector,
       );
 
@@ -53,20 +97,17 @@ class FaceRegistrationResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Repository
+// FaceAuthRepository
 // ─────────────────────────────────────────────────────────────────────────────
 
 class FaceAuthRepository {
-  /// Minimum frames required for registration. Must match FaceRegistrationPage.
   static const int _registrationFrameCount = 8;
 
-  // ── Registration ─────────────────────────────────────────────────────────────
+  // ── Registration ────────────────────────────────────────────────────────────
 
-  /// Average [collectedEmbeddings] into a single L2-normalised stored template.
-  /// Requires at least [_registrationFrameCount] good-quality frames.
   Future<FaceRegistrationResult> registerFaceFromFrames({
     required List<List<double>> collectedEmbeddings,
-    required String? userId,
+    required String?            userId,
   }) async {
     if (collectedEmbeddings.length < _registrationFrameCount) {
       return FaceRegistrationResult.failure(
@@ -89,29 +130,29 @@ class FaceAuthRepository {
         averaged[i] /= collectedEmbeddings.length;
       }
 
-      // L2 normalise — guard against degenerate all-zero vector
-      double norm = 0;
+      // L2 normalise the averaged embedding
+      double norm = 0.0;
       for (final v in averaged) norm += v * v;
       norm = math.sqrt(norm);
       final normalised = norm < 1e-10
-          ? averaged // already zero-ish, leave as-is
+          ? averaged
           : averaged.map((v) => v / norm).toList();
 
       final finalUserId =
           userId ?? 'user_${DateTime.now().millisecondsSinceEpoch}';
 
       final faceVector = FaceVectorModel(
-        id: DateTime.now().millisecondsSinceEpoch.toString(),
-        vector: normalised,
+        id:        DateTime.now().millisecondsSinceEpoch.toString(),
+        vector:    normalised,
         createdAt: DateTime.now(),
-        userId: finalUserId,
+        userId:    finalUserId,
       );
 
       debugPrint('[FaceAuthRepo] registered ${collectedEmbeddings.length} '
-          'frames → userId=$finalUserId');
+          'frames → userId=$finalUserId  dim=$dim');
 
       return FaceRegistrationResult.success(
-        userId: finalUserId,
+        userId:     finalUserId,
         faceVector: faceVector,
       );
     } catch (e) {
@@ -120,26 +161,25 @@ class FaceAuthRepository {
     }
   }
 
-  // ── Verification ─────────────────────────────────────────────────────────────
+  // ── Verification ────────────────────────────────────────────────────────────
 
-  /// Compares [liveVector] against [storedVector].
-  /// Uses cosine similarity via [MlFaceService.matchPercentage].
-  /// Threshold = [AppConstants.faceMatchThreshold] (80 %).
   Future<FaceVerificationResult> verifyFace({
     required FaceVectorModel liveVector,
     required FaceVectorModel storedVector,
   }) async {
     try {
+      // matchPercentage maps cosine [-1,1] → [0,100]
+      // FaceNet int-quantized threshold: cosine ≥ 0.50 → display ≥ 75 %
+      // AppConstants.faceMatchThreshold must equal 0.75
       final score = MlFaceService.matchPercentage(
         storedVector.vector,
         liveVector.vector,
-      ).clamp(0.0, 100.0); // safety clamp
+      ).clamp(0.0, 100.0);
 
-      debugPrint('[FaceAuthRepo] averaged match score: ${score.toStringAsFixed(2)}%');
+      debugPrint('[FaceAuthRepo] match score: ${score.toStringAsFixed(2)}%  '
+          'threshold: ${(AppConstants.faceMatchThreshold * 100).toStringAsFixed(0)}%');
 
-      final threshold = AppConstants.faceMatchThreshold * 100;
-
-      if (score >= threshold) {
+      if (score >= AppConstants.faceMatchThreshold * 100) {
         return FaceVerificationResult.success(score);
       } else {
         return FaceVerificationResult.failure(
@@ -156,6 +196,5 @@ class FaceAuthRepository {
     }
   }
 
-  /// Minimum frames required for registration.
   static int get requiredFrames => _registrationFrameCount;
 }

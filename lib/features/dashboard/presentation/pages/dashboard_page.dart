@@ -1,3 +1,15 @@
+// lib/features/dashboard/presentation/pages/dashboard_page.dart
+//
+// FIX: Added resumeIfNeeded() call in initState via addPostFrameCallback.
+// This is the final wiring piece for the ServiceRequestFailure fix chain:
+//
+//   main.dart          → FlutterForegroundTask.init() before runApp()
+//   monitoring_provider → _bootstrap() sets wasRunningOnBoot, does NOT start
+//   dashboard_page     → calls resumeIfNeeded() after auth confirms (here)
+//
+// Using addPostFrameCallback ensures the widget tree is fully built and
+// Provider.of() is safe to call before we access MonitoringProvider.
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -27,6 +39,21 @@ class _DashboardPageState extends State<DashboardPage>
       vsync: this,
       duration: const Duration(seconds: 10),
     )..repeat();
+
+    // ── FIX: resume monitoring after authentication ───────────────────────
+    // MonitoringProvider._bootstrap() intentionally does NOT call
+    // startService() on its own (to avoid a race with FlutterForegroundTask
+    // and to ensure auth has completed first). The Dashboard is the right
+    // place to trigger the resume — the user has passed face auth to get here.
+    //
+    // addPostFrameCallback: ensures the widget tree is fully built so
+    // context.read<MonitoringProvider>() works without "looking up a
+    // deactivated widget" errors.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        context.read<MonitoringProvider>().resumeIfNeeded();
+      }
+    });
   }
 
   @override
@@ -189,7 +216,8 @@ class _DashboardPageState extends State<DashboardPage>
         const SizedBox(height: AppTheme.spacingM),
 
         // FIX pixel overflow: DashboardCard has a fixed height already —
-        // wrapping in IntrinsicHeight added extra constraints causing 1.8px overflow
+        // wrapping in IntrinsicHeight added extra constraints causing 1.8px
+        // overflow. Using crossAxisAlignment.start avoids that.
         Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -241,7 +269,9 @@ class _DashboardPageState extends State<DashboardPage>
         // Security score: starts at 100%, drops 5 per today alert, min 50%
         final score = isActive
             ? (100 - (todayAlerts * 5)).clamp(50, 100)
-            : selectedCount > 0 ? 72 : 50;
+            : selectedCount > 0
+            ? 72
+            : 50;
 
         final scoreColor = score >= 90
             ? AppTheme.success
@@ -292,7 +322,7 @@ class _DashboardPageState extends State<DashboardPage>
                 children: [
                   Expanded(
                     child: _buildStatItem(
-                      icon: Icons.shield_outlined,
+                      icon:  Icons.shield_outlined,
                       label: 'Security Score',
                       value: '$score%',
                       color: scoreColor,
@@ -304,7 +334,7 @@ class _DashboardPageState extends State<DashboardPage>
                   ),
                   Expanded(
                     child: _buildStatItem(
-                      icon: Icons.access_time,
+                      icon:  Icons.access_time,
                       label: 'Unauth Time',
                       value: _fmtDuration(unauthTime),
                       color: unauthTime.inSeconds > 0
@@ -318,7 +348,7 @@ class _DashboardPageState extends State<DashboardPage>
                   ),
                   Expanded(
                     child: _buildStatItem(
-                      icon: Icons.warning_amber_outlined,
+                      icon:  Icons.warning_amber_outlined,
                       label: 'Total Alerts',
                       value: '$totalAlerts',
                       color: totalAlerts > 0
@@ -346,7 +376,8 @@ class _DashboardPageState extends State<DashboardPage>
                       Container(
                         width: 8, height: 8,
                         decoration: const BoxDecoration(
-                            color: AppTheme.error, shape: BoxShape.circle),
+                            color: AppTheme.error,
+                            shape: BoxShape.circle),
                       ),
                       const SizedBox(width: 8),
                       Expanded(
@@ -386,9 +417,9 @@ class _DashboardPageState extends State<DashboardPage>
 
   Widget _buildStatItem({
     required IconData icon,
-    required String label,
-    required String value,
-    required Color color,
+    required String   label,
+    required String   value,
+    required Color    color,
   }) {
     return Column(
       children: [

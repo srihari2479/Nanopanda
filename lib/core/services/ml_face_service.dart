@@ -1,415 +1,453 @@
 // lib/core/services/ml_face_service.dart
 //
-// Production-level on-device face recognition service.
-// Uses:
-//   • google_mlkit_face_detection  — face presence, landmarks, eye-open
-//                                    probability, head Euler angles
-//   • tflite_flutter               — FaceNet (int-quantized) → 128-dim embedding
-//   • package:image                — crop + resize face ROI to 112×112
+// Production ML face service — facenet_int_quantized.tflite + ML Kit.
 //
-// 100% on-device. No network calls. No API keys.
+// ROOT FIX: InputImageConverterError / IllegalArgumentException
+// ─────────────────────────────────────────────────────────────────────────────
+// The camera plugin gives YUV_420_888 frames where bytesPerRow > width
+// (hardware row-stride padding). Passing raw concatenated plane bytes to ML Kit
+// with format=yuv_420_888 causes byte-count mismatch → IllegalArgumentException
+// on every single frame → "no face detected" forever.
+//
+// Correct approach:
+//   1. Manually convert YUV420 → NV21 while STRIPPING row padding.
+//   2. Pass NV21 bytes to ML Kit with format=nv21 and bytesPerRow=width.
+//   NV21 has no padding — byte count is always exactly width*height*3/2.
+//
+// Model: assets/models/facenet_int_quantized.tflite
+//   Input:  [1, 160, 160, 3]  uint8   values 0–255 (INT8 quantized)
+//   Output: [1, 128]          float32 L2-normalised identity embedding
+//   Threshold: cosine ≥ 0.50  →  matchPercentage ≥ 75 %
+//   → AppConstants.faceMatchThreshold = 0.75
+//
+// HINT FIXES:
+//   - Removed `import 'dart:typed_data'` (unnecessary — Uint8List is provided
+//     by the camera package's transitive export; hint at line 24).
+//   - Added explicit braces to single-statement for loops (hints at lines
+//     377 and 424: "Statements in a for should be enclosed in a block").
 
-import 'dart:io';
 import 'dart:math' as math;
-import 'dart:typed_data';
+import 'dart:ui' show Rect, Size;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
+import 'package:flutter/services.dart' show Uint8List;
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:image/image.dart' as img;
 import 'package:tflite_flutter/tflite_flutter.dart';
-import 'package:path_provider/path_provider.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Data classes
+// FaceFrameResult
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Everything the caller needs from one processed camera frame.
-class FaceProcessingResult {
-  final bool faceFound;
-  final bool goodQuality;
-  final List<double>? embedding;         // 128-dim, null when no face
-  final double? leftEyeOpenProb;         // 0.0 – 1.0
-  final double? rightEyeOpenProb;        // 0.0 – 1.0
-  final double? headEulerY;              // degrees; positive = turned right
-  final String statusMessage;
+class FaceFrameResult {
+  final bool          faceFound;
+  final bool          goodQuality;
+  final bool          hasEmbedding;
+  final List<double>? embedding;
+  final String        statusMessage;
+  final double?       leftEyeOpenProb;
+  final double?       rightEyeOpenProb;
+  final double?       headEulerY;
 
-  const FaceProcessingResult({
+  const FaceFrameResult({
     required this.faceFound,
     required this.goodQuality,
+    required this.hasEmbedding,
     this.embedding,
+    required this.statusMessage,
     this.leftEyeOpenProb,
     this.rightEyeOpenProb,
     this.headEulerY,
-    required this.statusMessage,
   });
 
-  bool get hasEmbedding => embedding != null;
+  factory FaceFrameResult.noFace() => const FaceFrameResult(
+    faceFound:     false,
+    goodQuality:   false,
+    hasEmbedding:  false,
+    statusMessage: 'Look at the camera…',
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Service
+// MlFaceService
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Singleton. Call [initialize] once at app start (or before first use).
 class MlFaceService {
   MlFaceService._();
   static final MlFaceService instance = MlFaceService._();
 
-  FaceDetector? _detector;
-  Interpreter? _interpreter;
-  bool _isInitialized = false;
+  // cosine ≥ 0.50 → matchPercentage ≥ 75 %
+  // Set AppConstants.faceMatchThreshold = 0.75
+  static const double matchThreshold = 0.50;
 
-  bool get isInitialized => _isInitialized;
+  static const int    _inputSize  = 160;
+  static const int    _embedDim   = 128;
+  static const String _modelAsset = 'assets/models/facenet_int_quantized.tflite';
 
-  // MobileFaceNet I/O dimensions
-  static const int _inputSize    = 112;
-  static const int _embeddingDim = 128;
+  late FaceDetector _detector;
+  Interpreter?      _interpreter;
+  bool              _initialized = false;
 
-  // ── public ──────────────────────────────────────────────────────────────────
+  List<double>? _cachedStoredVector;
+  List<double>? get cachedStoredVector => _cachedStoredVector;
 
-  /// Idempotent — safe to call multiple times.
+  // ── Init ──────────────────────────────────────────────────────────────────
+
   Future<void> initialize() async {
-    if (_isInitialized) return;
+    if (_initialized) return;
 
     _detector = FaceDetector(
       options: FaceDetectorOptions(
-        enableClassification: true,   // eye-open probability
-        enableLandmarks: true,
-        enableContours: false,
-        enableTracking: false,
-        performanceMode: FaceDetectorMode.accurate,
-        minFaceSize: 0.15,
+        enableLandmarks:      false,
+        enableContours:       false,
+        enableClassification: true,  // eye open prob + euler for liveness
+        enableTracking:       false,
+        performanceMode:      FaceDetectorMode.accurate,
+        minFaceSize:          0.15,
       ),
     );
 
-    _interpreter = await _loadInterpreter();
-    _isInitialized = true;
-    debugPrint('[MlFaceService] ready');
-  }
-
-  /// Main entry point. Pass one camera frame and get back face info + embedding.
-  /// [sensorOrientation] = CameraDescription.sensorOrientation (typically 90 on Android).
-  Future<FaceProcessingResult> processFrame(
-      CameraImage frame,
-      int sensorOrientation,
-      ) async {
-    if (!_isInitialized) {
-      return const FaceProcessingResult(
-        faceFound: false,
-        goodQuality: false,
-        statusMessage: 'Service not initialized',
+    try {
+      _interpreter = await Interpreter.fromAsset(
+        _modelAsset,
+        options: InterpreterOptions()..threads = 2,
       );
+      debugPrint('[MlFaceService] facenet_int_quantized loaded ✓ '
+          'in=${_interpreter!.getInputTensor(0).shape} '
+          'out=${_interpreter!.getOutputTensor(0).shape}');
+    } catch (e) {
+      debugPrint('[MlFaceService] TFLite load FAILED: $e');
     }
 
+    _initialized = true;
+  }
+
+  void cacheStoredVector(List<double> v) {
+    _cachedStoredVector = v;
+    debugPrint('[MlFaceService] stored vector cached (${v.length}d)');
+  }
+
+  void clearCachedVector() => _cachedStoredVector = null;
+
+  // ── processFrame ──────────────────────────────────────────────────────────
+
+  Future<FaceFrameResult> processFrame(
+      CameraImage cameraImage,
+      int         sensorOrientation,
+      ) async {
+    if (!_initialized) await initialize();
+
     try {
-      // 1. Build InputImage for ML Kit
-      final inputImage = _toInputImage(frame, sensorOrientation);
-      if (inputImage == null) {
-        return const FaceProcessingResult(
-          faceFound: false,
-          goodQuality: false,
-          statusMessage: 'Frame conversion failed',
-        );
+      // Convert YUV420 → NV21, stripping row-stride padding so that
+      // byte count = width*height*3/2 exactly (what ML Kit demands).
+      final nv21 = _yuv420ToNv21(cameraImage);
+
+      final inputImage = InputImage.fromBytes(
+        bytes: nv21,
+        metadata: InputImageMetadata(
+          size: Size(
+            cameraImage.width.toDouble(),
+            cameraImage.height.toDouble(),
+          ),
+          rotation:    _rotationFromSensor(sensorOrientation),
+          format:      InputImageFormat.nv21,  // ← NV21, not yuv_420_888
+          bytesPerRow: cameraImage.width,      // ← no padding in NV21
+        ),
+      );
+
+      final faces = await _detector.processImage(inputImage);
+      if (faces.isEmpty) return FaceFrameResult.noFace();
+
+      final face = faces.reduce(
+            (a, b) => a.boundingBox.width > b.boundingBox.width ? a : b,
+      );
+
+      final eulerY   = face.headEulerAngleY ?? 0.0;
+      final eulerZ   = face.headEulerAngleZ ?? 0.0;
+      final leftEye  = face.leftEyeOpenProbability;
+      final rightEye = face.rightEyeOpenProbability;
+
+      final isFrontal   = eulerY.abs() < 25 && eulerZ.abs() < 20;
+      final eyesOpen    = (leftEye  == null || leftEye  > 0.4) &&
+          (rightEye == null || rightEye > 0.4);
+      final goodQuality = isFrontal && eyesOpen;
+
+      String statusMessage = 'Hold still…';
+      if (!isFrontal) {
+        statusMessage = 'Face the camera directly';
+      } else if (!eyesOpen) {
+        statusMessage = 'Open your eyes';
       }
 
-      // 2. Detect faces
-      final faces = await _detector!.processImage(inputImage);
-
-      if (faces.isEmpty) {
-        return const FaceProcessingResult(
-          faceFound: false,
-          goodQuality: false,
-          statusMessage: 'No face detected — look at the camera',
-        );
-      }
-      if (faces.length > 1) {
-        return const FaceProcessingResult(
-          faceFound: false,
-          goodQuality: false,
-          statusMessage: 'Multiple faces — only one person please',
-        );
+      List<double>? embedding;
+      if (goodQuality && _interpreter != null) {
+        embedding = _runFaceNet(cameraImage, face, sensorOrientation);
       }
 
-      final face      = faces.first;
-      final leftEye   = face.leftEyeOpenProbability;
-      final rightEye  = face.rightEyeOpenProbability;
-      final eulerY    = face.headEulerAngleY;
+      return FaceFrameResult(
+        faceFound:        true,
+        goodQuality:      goodQuality,
+        hasEmbedding:     embedding != null,
+        embedding:        embedding,
+        statusMessage:    statusMessage,
+        leftEyeOpenProb:  leftEye,
+        rightEyeOpenProb: rightEye,
+        headEulerY:       eulerY,
+      );
+    } catch (e) {
+      debugPrint('[MlFaceService] processFrame error: $e');
+      return FaceFrameResult.noFace();
+    }
+  }
 
-      // 3. Quality gates
-      //
-      // BUG FIX: The old gate checked `if (leftEye != null && rightEye != null)`
-      // and rejected if either eye < 0.3. This caused "Please open your eyes
-      // fully" to flash on screen during a blink attempt, confusing users into
-      // thinking the blink was wrong.
-      //
-      // More importantly: when BOTH eyes are null (fully closed during blink),
-      // the old gate was SKIPPED entirely — leaving the frame to fall through
-      // to embedding with potentially bad data.
-      //
-      // FIX: Always return faceFound=true with the raw eye/eulerY values so
-      // the liveness service can observe them (null = closed is handled there).
-      // Only apply the "eyes open" quality gate when we are NOT in a blink
-      // (i.e. at least one eye probability is available AND it is very low).
-      // This means the face is simply squinting/looking away, not blinking.
-      final bool likelyBlinking = leftEye == null && rightEye == null;
+  // ── YUV420 → NV21 conversion ──────────────────────────────────────────────
+  //
+  // YUV420 from camera plugin:
+  //   plane[0] = Y,  bytesPerRow may be padded  (e.g. 512 for width=480)
+  //   plane[1] = U,  bytesPerRow may be padded
+  //   plane[2] = V,  bytesPerRow may be padded
+  //
+  // NV21 layout (no padding):
+  //   [Y0 Y1 Y2 … Yn]  [V0 U0 V1 U1 … Vn Un]
+  //   total bytes = width * height * 3 / 2
 
-      if (!likelyBlinking && leftEye != null && rightEye != null) {
-        if (leftEye < 0.3 || rightEye < 0.3) {
-          return FaceProcessingResult(
-            faceFound: true,
-            goodQuality: false,
-            leftEyeOpenProb: leftEye,
-            rightEyeOpenProb: rightEye,
-            headEulerY: eulerY,
-            statusMessage: 'Please open your eyes fully',
-          );
+  Uint8List _yuv420ToNv21(CameraImage cam) {
+    final int w = cam.width;
+    final int h = cam.height;
+
+    final yPlane = cam.planes[0];
+    final uPlane = cam.planes[1];
+    final vPlane = cam.planes[2];
+
+    final nv21  = Uint8List(w * h * 3 ~/ 2);
+    int   index = 0;
+
+    // Copy Y plane — strip horizontal padding
+    for (int row = 0; row < h; row++) {
+      final rowStart = row * yPlane.bytesPerRow;
+      for (int col = 0; col < w; col++) {
+        nv21[index++] = yPlane.bytes[rowStart + col];
+      }
+    }
+
+    // Interleave V,U — NV21 = V first, then U
+    final uvPixelStride = uPlane.bytesPerPixel ?? 1;
+    for (int row = 0; row < h ~/ 2; row++) {
+      final rowStart = row * vPlane.bytesPerRow;
+      for (int col = 0; col < w ~/ 2; col++) {
+        final uvIdx = rowStart + col * uvPixelStride;
+        nv21[index++] = vPlane.bytes[uvIdx];
+        nv21[index++] = uPlane.bytes[uvIdx];
+      }
+    }
+
+    return nv21;
+  }
+
+  // ── FaceNet inference ─────────────────────────────────────────────────────
+
+  List<double>? _runFaceNet(
+      CameraImage cam,
+      Face        face,
+      int         sensorOrientation,
+      ) {
+    try {
+      final rgb = _nv21ToRgb(cam);
+      if (rgb == null) return null;
+
+      final oriented = _applyRotation(rgb, sensorOrientation);
+      final cropped  = _cropFace(oriented, face.boundingBox);
+      if (cropped == null) return null;
+
+      final resized = img.copyResize(
+        cropped,
+        width:         _inputSize,
+        height:        _inputSize,
+        interpolation: img.Interpolation.linear,
+      );
+
+      final input  = _buildUint8Input(resized);
+      final output = List.generate(1, (_) => List<double>.filled(_embedDim, 0.0));
+
+      _interpreter!.run(input, output);
+
+      return _l2Normalize(List<double>.from(output[0]));
+    } catch (e) {
+      debugPrint('[MlFaceService] _runFaceNet error: $e');
+      return null;
+    }
+  }
+
+  // ── Image helpers ─────────────────────────────────────────────────────────
+
+  img.Image? _nv21ToRgb(CameraImage cam) {
+    try {
+      final int w = cam.width;
+      final int h = cam.height;
+
+      final yPlane = cam.planes[0];
+      final uPlane = cam.planes[1];
+      final vPlane = cam.planes[2];
+
+      final yBytes = yPlane.bytes;
+      final uBytes = uPlane.bytes;
+      final vBytes = vPlane.bytes;
+
+      final uvRowStride   = uPlane.bytesPerRow;
+      final uvPixelStride = uPlane.bytesPerPixel ?? 1;
+
+      final image = img.Image(width: w, height: h);
+
+      for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+          final yIdx  = y * yPlane.bytesPerRow + x;
+          final uvIdx = (y ~/ 2) * uvRowStride + (x ~/ 2) * uvPixelStride;
+
+          if (yIdx  >= yBytes.length) { continue; }
+          if (uvIdx >= uBytes.length || uvIdx >= vBytes.length) { continue; }
+
+          final yv = yBytes[yIdx]  & 0xFF;
+          final uv = uBytes[uvIdx] & 0xFF;
+          final vv = vBytes[uvIdx] & 0xFF;
+
+          final c = yv - 16;
+          final d = uv - 128;
+          final e = vv - 128;
+
+          final r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255);
+          final g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255);
+          final b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255);
+
+          image.setPixelRgb(x, y, r, g, b);
         }
       }
-      if (eulerY != null && eulerY.abs() > 25) {
-        return FaceProcessingResult(
-          faceFound: true,
-          goodQuality: false,
-          leftEyeOpenProb: leftEye,
-          rightEyeOpenProb: rightEye,
-          headEulerY: eulerY,
-          statusMessage: 'Face the camera directly',
-        );
-      }
-
-      // 4. Convert full frame to RGB for cropping
-      final rgbImage = _toRgbImage(frame);
-      if (rgbImage == null) {
-        return const FaceProcessingResult(
-          faceFound: true,
-          goodQuality: false,
-          statusMessage: 'Image conversion failed',
-        );
-      }
-
-      // 5. Crop + resize face patch → 112×112
-      final facePatch = _cropAndResize(rgbImage, face.boundingBox);
-
-      // 6. MobileFaceNet inference
-      final embedding = _runInference(facePatch);
-
-      return FaceProcessingResult(
-        faceFound: true,
-        goodQuality: true,
-        embedding: embedding,
-        leftEyeOpenProb: leftEye,
-        rightEyeOpenProb: rightEye,
-        headEulerY: eulerY,
-        statusMessage: 'Face detected ✓',
-      );
-    } catch (e, st) {
-      debugPrint('[MlFaceService] processFrame error: $e\n$st');
-      return FaceProcessingResult(
-        faceFound: false,
-        goodQuality: false,
-        statusMessage: 'Error: $e',
-      );
+      return image;
+    } catch (e) {
+      debugPrint('[MlFaceService] nv21→rgb error: $e');
+      return null;
     }
   }
 
-  /// Cosine similarity between two L2-normalised embeddings → [0, 1].
+  img.Image _applyRotation(img.Image image, int degrees) {
+    switch (degrees) {
+      case 90:  return img.copyRotate(image, angle: 90);
+      case 180: return img.copyRotate(image, angle: 180);
+      case 270: return img.copyRotate(image, angle: 270);
+      default:  return image;
+    }
+  }
+
+  img.Image? _cropFace(img.Image image, Rect bb) {
+    final padX = bb.width  * 0.20;
+    final padY = bb.height * 0.20;
+
+    final left   = (bb.left   - padX).clamp(0.0, (image.width  - 1).toDouble()).toInt();
+    final top    = (bb.top    - padY).clamp(0.0, (image.height - 1).toDouble()).toInt();
+    final right  = (bb.right  + padX).clamp(0.0,  image.width.toDouble()).toInt();
+    final bottom = (bb.bottom + padY).clamp(0.0,  image.height.toDouble()).toInt();
+
+    final w = right - left;
+    final h = bottom - top;
+    if (w <= 0 || h <= 0) return null;
+
+    return img.copyCrop(image, x: left, y: top, width: w, height: h);
+  }
+
+  /// [1, 160, 160, 3] uint8 tensor for INT8 quantized FaceNet.
+  List<List<List<List<int>>>> _buildUint8Input(img.Image image) {
+    return List.generate(1, (_) =>
+        List.generate(_inputSize, (y) =>
+            List.generate(_inputSize, (x) {
+              final p = image.getPixel(x, y);
+              return [p.r.toInt(), p.g.toInt(), p.b.toInt()];
+            }),
+        ),
+    );
+  }
+
+  // ── Matching ──────────────────────────────────────────────────────────────
+
   static double cosineSimilarity(List<double> a, List<double> b) {
-    double dot = 0, na = 0, nb = 0;
+    if (a.length != b.length) return 0.0;
+    double dot = 0.0;
+    // FIX: enclosed in braces to clear "Statements in a for should be
+    // enclosed in a block" hint (line 377 in original).
     for (int i = 0; i < a.length; i++) {
       dot += a[i] * b[i];
-      na  += a[i] * a[i];
-      nb  += b[i] * b[i];
     }
-    if (na == 0 || nb == 0) return 0;
-    return dot / (math.sqrt(na) * math.sqrt(nb));
+    return dot.clamp(-1.0, 1.0);
   }
 
-  /// Returns a 0–100 match score. ≥80 = same person (configurable).
   static double matchPercentage(List<double> stored, List<double> live) {
-    return ((cosineSimilarity(stored, live) + 1.0) / 2.0) * 100.0;
+    return ((cosineSimilarity(stored, live) + 1.0) / 2.0 * 100.0)
+        .clamp(0.0, 100.0);
   }
 
-  /// Process a decoded JPEG image (from silent background capture).
-  /// Returns 128-dim L2-normalised embedding, or null if no face found.
-  Future<List<double>?> processJpegImage(img.Image jpegImage) async {
-    if (!_isInitialized) return null;
-    try {
-      // Resize to model input size
-      final resized = img.copyResize(jpegImage,
-          width: _inputSize, height: _inputSize,
-          interpolation: img.Interpolation.linear);
+  bool isMatch(List<double> stored, List<double> live) {
+    final sim = cosineSimilarity(stored, live);
+    debugPrint('[MlFaceService] cosine=${sim.toStringAsFixed(4)} '
+        'threshold=$matchThreshold');
+    return sim >= matchThreshold;
+  }
 
-      // Detect face region — use full image if detection fails
-      // (background capture already frames the face roughly)
-      final embedding = _runInference(resized);
-      return embedding;
+  // ── Standalone JPEG extraction (SilentFaceChannel / monitoring) ───────────
+
+  Future<List<double>?> extractEmbeddingFromBytes(Uint8List jpegBytes) async {
+    if (!_initialized) await initialize();
+    if (_interpreter == null) return null;
+
+    try {
+      final decoded = img.decodeImage(jpegBytes);
+      if (decoded == null) return null;
+
+      final resized = img.copyResize(
+        decoded,
+        width:  _inputSize,
+        height: _inputSize,
+      );
+
+      final input  = _buildUint8Input(resized);
+      final output = List.generate(1, (_) => List<double>.filled(_embedDim, 0.0));
+      _interpreter!.run(input, output);
+
+      return _l2Normalize(List<double>.from(output[0]));
     } catch (e) {
-      debugPrint('[MlFaceService] processJpegImage error: $e');
+      debugPrint('[MlFaceService] extractEmbeddingFromBytes error: $e');
       return null;
+    }
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  List<double> _l2Normalize(List<double> v) {
+    double norm = 0.0;
+    // FIX: enclosed in braces to clear "Statements in a for should be
+    // enclosed in a block" hint (line 424 in original).
+    for (final x in v) {
+      norm += x * x;
+    }
+    norm = math.sqrt(norm);
+    if (norm < 1e-10) return v;
+    return v.map((x) => x / norm).toList();
+  }
+
+  InputImageRotation _rotationFromSensor(int degrees) {
+    switch (degrees) {
+      case 0:   return InputImageRotation.rotation0deg;
+      case 90:  return InputImageRotation.rotation90deg;
+      case 180: return InputImageRotation.rotation180deg;
+      case 270: return InputImageRotation.rotation270deg;
+      default:  return InputImageRotation.rotation270deg;
     }
   }
 
   Future<void> dispose() async {
-    await _detector?.close();
-    _interpreter?.close();
-    _isInitialized = false;
-  }
-
-  // ── private helpers ──────────────────────────────────────────────────────────
-
-  Future<Interpreter> _loadInterpreter() async {
-    try {
-      return await Interpreter.fromAsset(
-        'assets/models/facenet_int_quantized.tflite',
-        options: InterpreterOptions()..threads = 2,
-      );
-    } catch (e) {
-      // Fallback: extract to temp file (required on some Android versions)
-      debugPrint('[MlFaceService] Asset load fallback: $e');
-      final data = await rootBundle.load('assets/models/facenet_int_quantized.tflite');
-      final dir  = await getTemporaryDirectory();
-      final file = File('${dir.path}/facenet_int_quantized.tflite');
-      await file.writeAsBytes(data.buffer.asUint8List());
-      return Interpreter.fromFile(file, options: InterpreterOptions()..threads = 2);
-    }
-  }
-
-  InputImage? _toInputImage(CameraImage image, int sensorOrientation) {
-    try {
-      // On Android the camera stream is always YUV420 (NV21 for ML Kit).
-      // We must manually interleave U/V planes into a single NV21 byte buffer:
-      //   [ Y plane (width*height bytes) ][ VU interleaved (width*height/2 bytes) ]
-      final int width  = image.width;
-      final int height = image.height;
-
-      final Uint8List yPlane  = image.planes[0].bytes;
-      final Uint8List uPlane  = image.planes[1].bytes;
-      final Uint8List vPlane  = image.planes[2].bytes;
-
-      // Build NV21 buffer
-      final Uint8List nv21 = Uint8List(width * height + (width * height ~/ 2));
-
-      // Copy Y plane (may have row padding — copy row by row)
-      final int yRowStride = image.planes[0].bytesPerRow;
-      int dstIdx = 0;
-      for (int row = 0; row < height; row++) {
-        nv21.setRange(dstIdx, dstIdx + width, yPlane, row * yRowStride);
-        dstIdx += width;
-      }
-
-      // Interleave V and U into NV21 (V first, then U)
-      final int uvRowStride   = image.planes[1].bytesPerRow;
-      final int uvPixelStride = image.planes[1].bytesPerPixel ?? 1;
-      for (int row = 0; row < height ~/ 2; row++) {
-        for (int col = 0; col < width ~/ 2; col++) {
-          final int uvIndex = row * uvRowStride + col * uvPixelStride;
-          nv21[dstIdx++] = vPlane[uvIndex]; // V
-          nv21[dstIdx++] = uPlane[uvIndex]; // U
-        }
-      }
-
-      final metadata = InputImageMetadata(
-        size: Size(width.toDouble(), height.toDouble()),
-        rotation: _rotationFromDegrees(sensorOrientation),
-        format: InputImageFormat.nv21,          // explicit NV21
-        bytesPerRow: width,                     // NV21 row stride = width
-      );
-
-      return InputImage.fromBytes(bytes: nv21, metadata: metadata);
-    } catch (e) {
-      debugPrint('[MlFaceService] _toInputImage error: $e');
-      return null;
-    }
-  }
-
-  img.Image? _toRgbImage(CameraImage frame) {
-    try {
-      if (frame.format.group == ImageFormatGroup.yuv420) {
-        return _yuv420ToRgb(frame);
-      } else if (frame.format.group == ImageFormatGroup.bgra8888) {
-        return img.Image.fromBytes(
-          width: frame.width,
-          height: frame.height,
-          bytes: frame.planes[0].bytes.buffer,
-          order: img.ChannelOrder.bgra,
-        );
-      }
-      return null;
-    } catch (e) {
-      return null;
-    }
-  }
-
-  img.Image _yuv420ToRgb(CameraImage image) {
-    final w = image.width, h = image.height;
-    final out = img.Image(width: w, height: h);
-    final yP  = image.planes[0];
-    final uP  = image.planes[1];
-    final vP  = image.planes[2];
-    final uvRowStride   = uP.bytesPerRow;
-    final uvPixelStride = uP.bytesPerPixel ?? 1;
-
-    for (int y = 0; y < h; y++) {
-      for (int x = 0; x < w; x++) {
-        final yIdx = y * yP.bytesPerRow + x;
-        final uvIdx = (y ~/ 2) * uvRowStride + (x ~/ 2) * uvPixelStride;
-        final yv = yP.bytes[yIdx] & 0xFF;
-        final u  = (uP.bytes[uvIdx] & 0xFF) - 128;
-        final v  = (vP.bytes[uvIdx] & 0xFF) - 128;
-        final r = (yv + 1.370705 * v).round().clamp(0, 255);
-        final g = (yv - 0.337633 * u - 0.698001 * v).round().clamp(0, 255);
-        final b = (yv + 1.732446 * u).round().clamp(0, 255);
-        out.setPixelRgb(x, y, r, g, b);
-      }
-    }
-    return out;
-  }
-
-  img.Image _cropAndResize(img.Image image, Rect bbox) {
-    final padX = bbox.width  * 0.20;
-    final padY = bbox.height * 0.20;
-    final x = math.max(0, (bbox.left  - padX).round());
-    final y = math.max(0, (bbox.top   - padY).round());
-    final w = math.min(image.width  - x, (bbox.width  + padX * 2).round());
-    final h = math.min(image.height - y, (bbox.height + padY * 2).round());
-    final cropped = img.copyCrop(image, x: x, y: y, width: w, height: h);
-    return img.copyResize(cropped,
-        width: _inputSize, height: _inputSize,
-        interpolation: img.Interpolation.linear);
-  }
-
-  List<double> _runInference(img.Image faceImage) {
-    // Input tensor: [1, 112, 112, 3]  values in [-1, 1]
-    final input = List.generate(1, (_) =>
-        List.generate(_inputSize, (y) =>
-            List.generate(_inputSize, (x) {
-              final p = faceImage.getPixel(x, y);
-              return [(p.r / 127.5) - 1.0, (p.g / 127.5) - 1.0, (p.b / 127.5) - 1.0];
-            })
-        )
-    );
-
-    // Output tensor: [1, 128]
-    final output = List.generate(1, (_) => List.filled(_embeddingDim, 0.0));
-    _interpreter!.run(input, output);
-
-    // L2 normalise
-    final raw  = output[0];
-    double norm = 0;
-    for (final v in raw) norm += v * v;
-    norm = math.sqrt(norm);
-    return norm == 0 ? raw : raw.map((v) => v / norm).toList();
-  }
-
-  // _flattenPlanes removed — NV21 conversion is done in _toInputImage
-
-  InputImageRotation _rotationFromDegrees(int deg) {
-    switch (deg) {
-      case 90:  return InputImageRotation.rotation90deg;
-      case 180: return InputImageRotation.rotation180deg;
-      case 270: return InputImageRotation.rotation270deg;
-      default:  return InputImageRotation.rotation0deg;
+    if (_initialized) {
+      await _detector.close();
+      _interpreter?.close();
+      _interpreter = null;
+      _initialized = false;
     }
   }
 }
