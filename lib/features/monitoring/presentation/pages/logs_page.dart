@@ -289,7 +289,18 @@ class _LogCard extends StatelessWidget {
       ),
       child: Container(
         margin:     const EdgeInsets.only(bottom: 12),
-        decoration: AppTheme.glassDecoration(opacity: 0.08),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(AppTheme.radiusLarge),
+          color: log.isUnwantedPerson
+              ? AppTheme.error.withOpacity(0.06)
+              : AppTheme.success.withOpacity(0.06),
+          border: Border(
+            left: BorderSide(
+              color: log.isUnwantedPerson ? AppTheme.error : AppTheme.success,
+              width: 3,
+            ),
+          ),
+        ),
         child: ClipRRect(
           borderRadius: BorderRadius.circular(AppTheme.radiusLarge),
           child: Column(
@@ -310,7 +321,7 @@ class _LogCard extends StatelessWidget {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          // App name + unauthorized badge
+                          // App name + AUTH/UNAUTH badge
                           Row(children: [
                             Expanded(
                               child: Text(
@@ -325,7 +336,9 @@ class _LogCard extends StatelessWidget {
                               ),
                             ),
                             const SizedBox(width: 6),
-                            _UnauthorizedBadge(),
+                            log.isUnwantedPerson
+                                ? _UnauthorizedBadge()
+                                : _AuthorizedBadge(),
                           ]),
 
                           const SizedBox(height: 4),
@@ -376,16 +389,28 @@ class _LogCard extends StatelessWidget {
                 padding: const EdgeInsets.symmetric(
                     horizontal: AppTheme.spacingM, vertical: 10),
                 decoration: BoxDecoration(
-                  color: AppTheme.error.withOpacity(0.06),
+                  color: log.isUnwantedPerson
+                      ? AppTheme.error.withOpacity(0.06)
+                      : AppTheme.success.withOpacity(0.06),
                   border: Border(
                     top: BorderSide(
-                        color: AppTheme.error.withOpacity(0.12)),
+                      color: log.isUnwantedPerson
+                          ? AppTheme.error.withOpacity(0.12)
+                          : AppTheme.success.withOpacity(0.12),
+                    ),
                   ),
                 ),
                 child: Row(
                   children: [
-                    Icon(Icons.info_outline,
-                        size: 14, color: AppTheme.error.withOpacity(0.7)),
+                    Icon(
+                      log.isUnwantedPerson
+                          ? Icons.warning_amber_rounded
+                          : Icons.verified_user_outlined,
+                      size: 14,
+                      color: log.isUnwantedPerson
+                          ? AppTheme.error.withOpacity(0.7)
+                          : AppTheme.success.withOpacity(0.7),
+                    ),
                     const SizedBox(width: 6),
                     Expanded(
                       child: Text(
@@ -600,6 +625,29 @@ class _UnauthorizedBadge extends StatelessWidget {
           fontSize:   9,
           fontWeight: FontWeight.w700,
           color:      AppTheme.error,
+          letterSpacing: 0.5,
+        ),
+      ),
+    );
+  }
+}
+
+class _AuthorizedBadge extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color:        AppTheme.success.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(6),
+        border:       Border.all(color: AppTheme.success.withOpacity(0.3)),
+      ),
+      child: Text(
+        'AUTH',
+        style: GoogleFonts.inter(
+          fontSize:   9,
+          fontWeight: FontWeight.w700,
+          color:      AppTheme.success,
           letterSpacing: 0.5,
         ),
       ),

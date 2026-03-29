@@ -1,11 +1,8 @@
 // lib/main.dart
 //
-// Added:
-//   • navigatorKey — GlobalKey<NavigatorState> passed to both MaterialApp
-//     and MonitoringService.navigatorKey so the polling service can push
-//     /face-overlay from the background without a BuildContext.
-//   • '/face-overlay' route — FaceOverlayPage, full-screen, no animation
-//     (appears instantly to feel like a system overlay).
+// SIMPLIFIED: No /face-overlay route needed.
+// Background capture is done by BackgroundMonitorService.kt via Camera2.
+// Owner sees results in Logs page after opening Nanopanda.
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -27,19 +24,12 @@ import 'features/emotion/presentation/pages/emotion_detection_page.dart';
 import 'features/emotion/presentation/pages/emotion_result_page.dart';
 import 'features/monitoring/presentation/pages/app_selection_page.dart';
 import 'features/monitoring/presentation/pages/logs_page.dart';
-import 'features/monitoring/presentation/pages/face_overlay_page.dart';
-
-// ── Global navigator key ──────────────────────────────────────────────────────
-// MonitoringService uses this to push /face-overlay from polling context.
-final _navigatorKey = GlobalKey<NavigatorState>();
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // FIX 1: initCommunicationPort() before runApp()
   FlutterForegroundTask.initCommunicationPort();
 
-  // FIX 2: init() before runApp() so config is ready before providers build
   FlutterForegroundTask.init(
     androidNotificationOptions: AndroidNotificationOptions(
       channelId:          'nanopanda_monitoring',
@@ -61,9 +51,8 @@ void main() async {
     ),
   );
 
-  // Register navigatorKey with MonitoringService BEFORE runApp so it's
-  // available as soon as polling might fire.
-  MonitoringService.navigatorKey = _navigatorKey;
+  // navigatorKey not needed for background capture flow — kept for compat
+  MonitoringService.navigatorKey = null;
 
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
@@ -109,7 +98,6 @@ class FaceGuardApp extends StatelessWidget {
       title:                      'Nanopanda',
       debugShowCheckedModeBanner: false,
       theme:                      AppTheme.darkTheme,
-      navigatorKey:               _navigatorKey,   // ← key registered here
       home:                       const AppRouter(),
       onGenerateRoute:            _generateRoute,
     );
@@ -134,24 +122,6 @@ class FaceGuardApp extends StatelessWidget {
         return _page(const AppSelectionPage());
       case '/logs':
         return _page(const LogsPage());
-
-    // ── Face overlay — instant (no animation) ─────────────────────────────
-      case '/face-overlay':
-        final args = settings.arguments as Map<String, dynamic>? ?? {};
-        return PageRouteBuilder(
-          pageBuilder: (_, __, ___) => FaceOverlayPage(
-            packageName: args['packageName'] as String? ?? '',
-            appName:     args['appName']     as String? ?? 'Unknown App',
-            detectedAt:  args['detectedAt'] != null
-                ? DateTime.parse(args['detectedAt'] as String)
-                : DateTime.now(),
-          ),
-          transitionDuration: Duration.zero,
-          reverseTransitionDuration: Duration.zero,
-          transitionsBuilder: (_, __, ___, child) => child,
-          fullscreenDialog: true,
-        );
-
       default:
         return null;
     }

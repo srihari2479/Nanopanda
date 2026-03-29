@@ -267,6 +267,10 @@ class _FaceRegistrationPageState extends State<FaceRegistrationPage>
         });
         await storage.saveFaceVector(result.faceVector!);
         if (result.userId != null) await storage.saveUserId(result.userId!);
+        // Mark that this vector was saved with correct float32 preprocessing.
+        // face_login_page checks this on startup and forces re-registration
+        // if the stored vector is stale (old uint8 preprocessing).
+        await storage.saveEmbeddingVersion(StorageService.currentEmbeddingVersion);
         await appState.setFaceRegistered(true);
         HapticFeedback.heavyImpact();
 

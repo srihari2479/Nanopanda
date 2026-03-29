@@ -117,6 +117,8 @@ class _SettingsPageState extends State<SettingsPage> {
     try {
       final storage  = context.read<StorageService>();
       final appState = context.read<AppStateProvider>();
+      // deleteFaceVector() also clears the embedding version tag,
+      // so the new registration will write the correct 'float32_v1' tag.
       await storage.deleteFaceVector();
       await appState.setFaceRegistered(false);
       if (!mounted) return;

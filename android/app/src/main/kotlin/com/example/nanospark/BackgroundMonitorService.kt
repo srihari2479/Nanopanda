@@ -1,31 +1,62 @@
 package com.example.nanospark
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BackgroundMonitorService.kt
+//
+// CORRECT FLOW:
+//   1. Service polls UsageStats every 1.5s for watched packages.
+//   2. Watched app detected → open front camera with Camera2 API directly.
+//   3. Capture one JPEG frame silently (Android shows camera indicator dot —
+//      this is intentional and expected per Android policy).
+//   4. Save JPEG to face_logs/ directory.
+//   5. Save pending log entry to SharedPrefs with photoPath + pendingVerify=true.
+//   6. Flutter reads pending logs when owner opens Nanopanda → ML compare →
+//      show in Logs page.
+//
+// WHY Camera2 HERE (not Flutter camera plugin):
+//   Flutter camera plugin requires an active Activity in the foreground.
+//   When the user opens HappyPay and Nanopanda is in the background, there is
+//   NO foreground Activity → Flutter plugin throws "op=CAMERA not allowed".
+//   Camera2 API can be used from a Service context directly on Android 9+.
+//   targetSdk=34 means the camera indicator dot appears (Android policy) which
+//   is acceptable — we are not hiding the capture from Android OS.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import android.Manifest
+import android.annotation.SuppressLint
 import android.app.*
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.graphics.ImageFormat
+import android.hardware.camera2.*
+import android.media.ImageReader
 import android.os.*
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
 
-private const val TAG         = "BGMonitorSvc"
-private const val CHANNEL_ID  = "nanopanda_bg_monitor"
-private const val NOTIF_ID    = 8001
-private const val PREFS_NAME  = "FlutterSharedPreferences"
+private const val TAG        = "BGMonitorSvc"
+private const val CHANNEL_ID = "nanopanda_bg_monitor"
+private const val NOTIF_ID   = 8001
+
+private const val PREFS_NAME         = "FlutterSharedPreferences"
 private const val KEY_WATCHED        = "flutter.nanopanda_watched_packages"
 private const val KEY_PENDING        = "flutter.nanopanda_pending_logs"
-private const val KEY_CAPTURE_REQ    = "flutter.nanopanda_capture_request"
-private const val KEY_CAPTURE_RESULT = "flutter.nanopanda_capture_result"
-
-// Intent extra that tells MainActivity to run a silent capture immediately
-const val EXTRA_SILENT_CAPTURE = "nanopanda_silent_capture"
 
 class BackgroundMonitorService : Service() {
 
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val mainHandler  = Handler(Looper.getMainLooper())
+    private val cameraHandler: Handler by lazy {
+        val t = HandlerThread("CameraBackground").apply { start() }
+        Handler(t.looper)
+    }
 
     private val pollRunnable = object : Runnable {
         override fun run() {
@@ -34,7 +65,8 @@ class BackgroundMonitorService : Service() {
         }
     }
 
-    private val activePackages  = mutableSetOf<String>()
+    private val activePackages = mutableSetOf<String>()
+    private var captureInProgress = false
     private var prefs: SharedPreferences? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -81,6 +113,7 @@ class BackgroundMonitorService : Service() {
             startForeground(
                 NOTIF_ID, notif,
                 android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                        or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
             )
         } else {
             startForeground(NOTIF_ID, notif)
@@ -94,58 +127,207 @@ class BackgroundMonitorService : Service() {
         if (watched.isEmpty()) return
         val current = getForegroundPackage() ?: return
 
-        // Watched app closed — clear tracking
+        // Watched app closed → clear tracking
         if (current !in watched) {
             activePackages.removeAll(activePackages.intersect(watched.toSet()))
         }
 
-        // New watched app opened → write request AND bring MainActivity to front
+        // New watched app opened → capture face
         if (current in watched && current !in activePackages) {
             activePackages.add(current)
             val entryTime = System.currentTimeMillis()
-            Log.i(TAG, "watched app opened: $current → launching MainActivity for capture")
-            writeCaptureRequest(current, entryTime)
-            launchMainActivity(current, entryTime)
-        }
+            Log.i(TAG, "watched app opened: $current → starting background capture")
 
-        // Check if Flutter already wrote a capture result (cleanup old ones)
-        clearStaleResult()
+            if (!captureInProgress) {
+                captureInProgress = true
+                captureAndSave(current, entryTime)
+            }
+        }
     }
 
-    // ── Capture request → SharedPreferences ──────────────────────────────────
+    // ── Camera2 background capture ────────────────────────────────────────────
 
-    private fun writeCaptureRequest(pkg: String, entryTime: Long) {
-        val req = JSONObject().apply {
-            put("pkg",       pkg)
-            put("entryTime", entryTime)
-            put("status",    "pending")
+    @SuppressLint("MissingPermission")
+    private fun captureAndSave(pkg: String, entryTime: Long) {
+        // Check CAMERA permission — must be granted in AndroidManifest
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            != PackageManager.PERMISSION_GRANTED) {
+            Log.e(TAG, "CAMERA permission not granted — cannot capture")
+            savePendingLog(pkg, entryTime, null, false)
+            captureInProgress = false
+            return
         }
-        prefs?.edit()
-            ?.putString(KEY_CAPTURE_REQ, req.toString())
-            ?.apply()
-        Log.d(TAG, "capture request written for $pkg")
-    }
 
-    // ── Clean up stale results (prevent duplicate logs) ───────────────────────
+        val manager = getSystemService(CAMERA_SERVICE) as CameraManager
 
-    private fun clearStaleResult() {
-        val raw = prefs?.getString(KEY_CAPTURE_RESULT, null) ?: return
-        try {
-            val res = JSONObject(raw)
-            if (res.optString("status") == "done") {
-                val pkg       = res.optString("pkg")
-                val entryTime = res.optLong("entryTime", System.currentTimeMillis())
-                val photoPath = res.optString("photoPath").takeIf { it.isNotEmpty() }
-
-                Log.i(TAG, "capture result received: pkg=$pkg photo=$photoPath")
-                prefs?.edit()?.remove(KEY_CAPTURE_RESULT)?.apply()
-                activePackages.remove(pkg)
-
-                savePendingLog(pkg, entryTime, photoPath, photoPath != null)
+        // Find front camera
+        val frontCameraId = try {
+            manager.cameraIdList.firstOrNull { id ->
+                val chars = manager.getCameraCharacteristics(id)
+                chars.get(CameraCharacteristics.LENS_FACING) ==
+                        CameraCharacteristics.LENS_FACING_FRONT
             }
         } catch (e: Exception) {
-            Log.e(TAG, "clearStaleResult error: $e")
-            prefs?.edit()?.remove(KEY_CAPTURE_RESULT)?.apply()
+            Log.e(TAG, "camera list error: $e")
+            null
+        }
+
+        if (frontCameraId == null) {
+            Log.e(TAG, "no front camera found")
+            savePendingLog(pkg, entryTime, null, false)
+            captureInProgress = false
+            return
+        }
+
+        val imageReader = ImageReader.newInstance(640, 480, ImageFormat.JPEG, 1)
+
+        imageReader.setOnImageAvailableListener({ reader ->
+            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            try {
+                val buffer = image.planes[0].buffer
+                val bytes  = ByteArray(buffer.remaining())
+                buffer.get(bytes)
+
+                val savedPath = saveJpeg(pkg, bytes)
+                Log.i(TAG, "face captured → $savedPath")
+
+                mainHandler.post {
+                    savePendingLog(pkg, entryTime, savedPath, savedPath != null)
+                    captureInProgress = false
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "image save error: $e")
+                mainHandler.post {
+                    savePendingLog(pkg, entryTime, null, false)
+                    captureInProgress = false
+                }
+            } finally {
+                image.close()
+                reader.close()
+            }
+        }, cameraHandler)
+
+        // Open camera and capture
+        try {
+            manager.openCamera(frontCameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    try {
+                        val surface  = imageReader.surface
+                        val builder  = camera.createCaptureRequest(
+                            CameraDevice.TEMPLATE_STILL_CAPTURE)
+                        builder.addTarget(surface)
+                        builder.set(CaptureRequest.CONTROL_MODE,
+                            CaptureRequest.CONTROL_MODE_AUTO)
+                        builder.set(CaptureRequest.CONTROL_AF_MODE,
+                            CaptureRequest.CONTROL_AF_MODE_AUTO)
+                        builder.set(CaptureRequest.CONTROL_AE_MODE,
+                            CaptureRequest.CONTROL_AE_MODE_ON)
+                        builder.set(CaptureRequest.JPEG_QUALITY, 90)
+
+                        camera.createCaptureSession(
+                            listOf(surface),
+                            object : CameraCaptureSession.StateCallback() {
+                                override fun onConfigured(session: CameraCaptureSession) {
+                                    // Let AE settle for 800ms then capture
+                                    cameraHandler.postDelayed({
+                                        try {
+                                            session.capture(builder.build(),
+                                                object : CameraCaptureSession.CaptureCallback() {
+                                                    override fun onCaptureCompleted(
+                                                        s: CameraCaptureSession,
+                                                        r: CaptureRequest,
+                                                        result: TotalCaptureResult
+                                                    ) {
+                                                        // image arrives via ImageReader listener
+                                                        // Close camera after short delay
+                                                        cameraHandler.postDelayed({
+                                                            try { camera.close() } catch (_: Exception) {}
+                                                        }, 500)
+                                                    }
+                                                    override fun onCaptureFailed(
+                                                        s: CameraCaptureSession,
+                                                        r: CaptureRequest,
+                                                        failure: CaptureFailure
+                                                    ) {
+                                                        Log.e(TAG, "capture failed: ${failure.reason}")
+                                                        camera.close()
+                                                        mainHandler.post {
+                                                            savePendingLog(pkg, entryTime, null, false)
+                                                            captureInProgress = false
+                                                        }
+                                                    }
+                                                },
+                                                cameraHandler
+                                            )
+                                        } catch (e: Exception) {
+                                            Log.e(TAG, "capture request error: $e")
+                                            camera.close()
+                                            mainHandler.post {
+                                                savePendingLog(pkg, entryTime, null, false)
+                                                captureInProgress = false
+                                            }
+                                        }
+                                    }, 800)
+                                }
+
+                                override fun onConfigureFailed(session: CameraCaptureSession) {
+                                    Log.e(TAG, "session configure failed")
+                                    camera.close()
+                                    mainHandler.post {
+                                        savePendingLog(pkg, entryTime, null, false)
+                                        captureInProgress = false
+                                    }
+                                }
+                            },
+                            cameraHandler
+                        )
+                    } catch (e: Exception) {
+                        Log.e(TAG, "session creation error: $e")
+                        camera.close()
+                        mainHandler.post {
+                            savePendingLog(pkg, entryTime, null, false)
+                            captureInProgress = false
+                        }
+                    }
+                }
+
+                override fun onDisconnected(camera: CameraDevice) {
+                    camera.close()
+                    mainHandler.post { captureInProgress = false }
+                }
+
+                override fun onError(camera: CameraDevice, error: Int) {
+                    Log.e(TAG, "camera error: $error")
+                    camera.close()
+                    mainHandler.post {
+                        savePendingLog(pkg, entryTime, null, false)
+                        captureInProgress = false
+                    }
+                }
+            }, cameraHandler)
+        } catch (e: Exception) {
+            Log.e(TAG, "openCamera error: $e")
+            savePendingLog(pkg, entryTime, null, false)
+            captureInProgress = false
+        }
+    }
+
+    // ── Save JPEG ─────────────────────────────────────────────────────────────
+
+    private fun saveJpeg(pkg: String, bytes: ByteArray): String? {
+        return try {
+            // Match Flutter's getApplicationDocumentsDirectory() path
+            val baseDir = File(filesDir.parent ?: filesDir.absolutePath, "app_flutter/face_logs")
+            if (!baseDir.exists()) baseDir.mkdirs()
+
+            val filename = "face_${pkg.replace('.', '_')}_${System.currentTimeMillis()}.jpg"
+            val file     = File(baseDir, filename)
+            FileOutputStream(file).use { it.write(bytes) }
+            Log.d(TAG, "JPEG saved: ${file.absolutePath} (${bytes.size} bytes)")
+            file.absolutePath
+        } catch (e: Exception) {
+            Log.e(TAG, "saveJpeg error: $e")
+            null
         }
     }
 
@@ -178,31 +360,6 @@ class BackgroundMonitorService : Service() {
             Log.i(TAG, "pending log saved: $pkg hasPhoto=$hasPhoto")
         } catch (e: Exception) {
             Log.e(TAG, "savePendingLog: $e")
-        }
-    }
-
-    // ── Launch MainActivity for silent capture ────────────────────────────────
-    // targetSdk = 34 → BAL is allowed from FOREGROUND_SERVICE on Android 14/15.
-    // We bring MainActivity to the front so the camera plugin works (OEM ROMs
-    // block camera access for background activities).
-
-    private fun launchMainActivity(pkg: String, entryTime: Long) {
-        try {
-            val intent = Intent(this, MainActivity::class.java).apply {
-                addFlags(
-                    Intent.FLAG_ACTIVITY_NEW_TASK or
-                            Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
-                )
-                putExtra(EXTRA_SILENT_CAPTURE, true)
-                putExtra("capture_pkg",        pkg)
-                putExtra("capture_entry_time", entryTime)
-            }
-            startActivity(intent)
-            Log.i(TAG, "launched MainActivity for capture: pkg=$pkg")
-        } catch (e: Exception) {
-            Log.e(TAG, "launchMainActivity failed: $e")
-            // Fallback: request stays in SharedPrefs — Flutter poller will
-            // pick it up next time the app comes to the foreground naturally.
         }
     }
 

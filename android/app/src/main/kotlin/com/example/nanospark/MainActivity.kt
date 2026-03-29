@@ -68,39 +68,13 @@ class MainActivity : FlutterActivity() {
         setupBgMonitorChannel(flutterEngine)
         setupBgCaptureChannel(flutterEngine)
         setupScreenEventChannel(flutterEngine)
-        setupCaptureEventChannel(flutterEngine)    // NEW
+        setupCaptureEventChannel(flutterEngine)
         registerScreenReceiver()
-
-        // Handle the case where MainActivity was launched cold with the capture flag
-        handleSilentCaptureIntent(intent)
     }
-
-    // ── KEY FIX: Handle launch intent and re-deliveries ──────────────────────
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        handleSilentCaptureIntent(intent)
-    }
-
-    // When the service brings us to the foreground for a silent capture,
-    // push a "silentCaptureReady" event to Flutter via the EventChannel.
-    // Flutter will call _pollAndCapture() immediately on receiving this.
-    private fun handleSilentCaptureIntent(intent: Intent?) {
-        if (intent?.getBooleanExtra(EXTRA_SILENT_CAPTURE, false) == true) {
-            val pkg       = intent.getStringExtra("capture_pkg") ?: ""
-            val entryTime = intent.getLongExtra("capture_entry_time", 0L)
-            android.util.Log.d("MainActivity", "silent capture intent received: pkg=$pkg")
-
-            // Post on main thread — Flutter event sink must be called from main
-            mainHandler.post {
-                captureEventSink?.success(mapOf(
-                    "event"     to "silentCaptureReady",
-                    "pkg"       to pkg,
-                    "entryTime" to entryTime,
-                ))
-            }
-        }
     }
 
     override fun onDestroy() {

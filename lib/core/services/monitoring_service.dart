@@ -1,21 +1,17 @@
 // lib/core/services/monitoring_service.dart
 //
-// OVERLAY ARCHITECTURE:
-//
-//   When a watched app is detected:
-//     1. MonitoringService calls the global navigatorKey to push /face-overlay.
-//        This brings Nanopanda's Activity to the front instantly.
-//     2. FaceOverlayPage opens camera, runs ML, delivers OverlayResult.
-//     3. MonitoringProvider.onOverlayResult() saves the log entry.
-//
-//   flutter_foreground_task keepalive is still used (non-fatal if fails).
-//   NO SilentFaceService. Camera only opens inside FaceOverlayPage.
+// CORRECT FLOW:
+//   MonitoringService polls foreground app every 1.5s.
+//   When a watched app is detected → emits appOpened event (for dashboard UI).
+//   When it closes → emits appClosed event.
+//   NO overlay push. NO navigator. NO FaceOverlay.
+//   Background capture is handled entirely by BackgroundMonitorService.kt
+//   using Camera2 API — no Flutter involvement needed.
 
 import 'dart:async';
 
 import 'package:awesome_notifications/awesome_notifications.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart'
     hide NotificationPermission;
@@ -86,9 +82,9 @@ class MonitoringService {
 
   static const _channel = MethodChannel('nanopanda/monitoring');
 
-  /// Set this from main.dart BEFORE runApp.
-  /// MonitoringService uses it to push /face-overlay from background polling.
-  static GlobalKey<NavigatorState>? navigatorKey;
+  // navigatorKey kept for compile-compat with main.dart — NOT used for overlay.
+  // Background capture does not require MainActivity to come to foreground.
+  static dynamic navigatorKey;
 
   final _eventController = StreamController<MonitoringEvent>.broadcast();
   Stream<MonitoringEvent> get events => _eventController.stream;
@@ -96,13 +92,10 @@ class MonitoringService {
   bool _initialized       = false;
   bool _foregroundRunning = false;
 
-  Set<String>         _watchedPackages = {};
-  Map<String, String> _appNameMap      = {};
+  Set<String>         _watchedPackages  = {};
+  Map<String, String> _appNameMap       = {};
   String?             _currentForeground;
   Timer?              _pollTimer;
-
-  // Packages for which overlay is currently visible — prevents double-trigger
-  final Set<String> _overlayActive = {};
 
   // ── Init ──────────────────────────────────────────────────────────────────
 
@@ -117,8 +110,7 @@ class MonitoringService {
       debugPrint('[MonitoringService] face vector cached '
           '(${faceVector.vector.length}d)');
     } else {
-      debugPrint('[MonitoringService] WARNING: no face vector — '
-          'all faces will be treated as unauthorized.');
+      debugPrint('[MonitoringService] WARNING: no face vector stored yet.');
     }
 
     FlutterForegroundTask.addTaskDataCallback(_onTaskData);
@@ -152,14 +144,13 @@ class MonitoringService {
       const Duration(milliseconds: 1500),
           (_) => _poll(),
     );
-    debugPrint('[MonitoringService] polling started (main isolate)');
+    debugPrint('[MonitoringService] polling started');
   }
 
   void _stopPolling() {
     _pollTimer?.cancel();
     _pollTimer         = null;
     _currentForeground = null;
-    _overlayActive.clear();
     debugPrint('[MonitoringService] polling stopped');
   }
 
@@ -172,9 +163,8 @@ class MonitoringService {
       final previous     = _currentForeground;
       _currentForeground = pkg;
 
-      // ── App closed ────────────────────────────────────────────────────────
+      // App closed
       if (previous != null && _watchedPackages.contains(previous)) {
-        _overlayActive.remove(previous);
         _eventController.add(MonitoringEvent(
           type:        MonitoringEventType.appClosed,
           packageName: previous,
@@ -184,11 +174,17 @@ class MonitoringService {
         debugPrint('[MonitoringService] app closed: $previous');
       }
 
-      // ── Watched app opened ────────────────────────────────────────────────
-      if (_watchedPackages.contains(pkg) && !_overlayActive.contains(pkg)) {
-        _overlayActive.add(pkg);
-        debugPrint('[MonitoringService] watched app opened: $pkg → overlay');
-        _showOverlay(pkg);
+      // Watched app opened — emit event for dashboard session display only
+      if (_watchedPackages.contains(pkg)) {
+        debugPrint('[MonitoringService] watched app opened: $pkg '
+            '(bg capture handled by Kotlin service)');
+        _eventController.add(MonitoringEvent(
+          type:         MonitoringEventType.appOpened,
+          packageName:  pkg,
+          appName:      _resolveAppName(pkg),
+          timestamp:    DateTime.now(),
+          isAuthorized: false, // unknown until ML verify on app open
+        ));
       }
     } on PlatformException catch (e) {
       if (e.code == 'PERMISSION_DENIED') {
@@ -204,41 +200,6 @@ class MonitoringService {
     } catch (e) {
       debugPrint('[MonitoringService] poll error: $e');
     }
-  }
-
-  // ── Overlay trigger ───────────────────────────────────────────────────────
-
-  void _showOverlay(String packageName) {
-    final now = DateTime.now();
-    final nav = navigatorKey?.currentState;
-
-    if (nav == null) {
-      // App is fully backgrounded — navigator not available.
-      // BackgroundMonitorService already wrote a capture request to SharedPrefs.
-      // MonitoringProvider will handle it when app comes to foreground:
-      //   _pollAndCapture() → _executeSilentCapture() → _pushOverlayAfterCapture()
-      // Do NOT emit an unauthorized event here — that would create a duplicate
-      // log entry alongside the one from the bg capture flow.
-      debugPrint('[MonitoringService] navigator unavailable — '
-          'bg capture will handle $packageName when app foregrounds');
-      _overlayActive.remove(packageName); // allow re-trigger when foreground
-      return;
-    }
-
-    debugPrint('[MonitoringService] pushing overlay for $packageName');
-    nav.pushNamed(
-      '/face-overlay',
-      arguments: {
-        'packageName': packageName,
-        'appName':     _resolveAppName(packageName),
-        'detectedAt':  now.toIso8601String(),
-      },
-    );
-  }
-
-  /// Call when overlay is dismissed so next open re-triggers correctly.
-  void onOverlayDismissed(String packageName) {
-    _overlayActive.remove(packageName);
   }
 
   // ── Public: start / stop ──────────────────────────────────────────────────
@@ -275,8 +236,7 @@ class MonitoringService {
     _watchedPackages = Set<String>.from(watchedPackages);
     _startPolling();
 
-    debugPrint('[MonitoringService] ✓ started — watching: $_watchedPackages  '
-        'foreground: $_foregroundRunning');
+    debugPrint('[MonitoringService] ✓ started — watching: $_watchedPackages');
     return true;
   }
 

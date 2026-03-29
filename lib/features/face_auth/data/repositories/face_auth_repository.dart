@@ -168,18 +168,22 @@ class FaceAuthRepository {
     required FaceVectorModel storedVector,
   }) async {
     try {
-      // matchPercentage maps cosine [-1,1] → [0,100]
-      // FaceNet int-quantized threshold: cosine ≥ 0.50 → display ≥ 75 %
-      // AppConstants.faceMatchThreshold must equal 0.75
+      // Use raw cosine comparison against matchThreshold (0.60).
+      // New matchPercentage = cosine*100: owner ~75-95%, strangers ~0-35%.
+      final cosine = MlFaceService.cosineSimilarity(
+        storedVector.vector,
+        liveVector.vector,
+      );
       final score = MlFaceService.matchPercentage(
         storedVector.vector,
         liveVector.vector,
       ).clamp(0.0, 100.0);
 
-      debugPrint('[FaceAuthRepo] match score: ${score.toStringAsFixed(2)}%  '
-          'threshold: ${(AppConstants.faceMatchThreshold * 100).toStringAsFixed(0)}%');
+      debugPrint('[FaceAuthRepo] cosine=${cosine.toStringAsFixed(4)} '
+          'score=${score.toStringAsFixed(2)}%  '
+          'threshold=${MlFaceService.matchThreshold}');
 
-      if (score >= AppConstants.faceMatchThreshold * 100) {
+      if (cosine >= MlFaceService.matchThreshold) {
         return FaceVerificationResult.success(score);
       } else {
         return FaceVerificationResult.failure(

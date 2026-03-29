@@ -33,7 +33,6 @@ import '../../../../core/services/camera_service.dart';
 import '../../../../core/services/ml_face_service.dart';
 import '../../../../core/services/storage_service.dart';
 import '../../../../theme/theme.dart';
-import '../../data/repositories/face_auth_repository.dart';
 import '../widgets/camera_overlay.dart';
 import '../widgets/scanning_animation.dart';
 
@@ -50,7 +49,6 @@ class _FaceLoginPageState extends State<FaceLoginPage>
   // ── Services ─────────────────────────────────────────────────────────────────
   final _cameraService = CameraService();
   final _mlService     = MlFaceService.instance;
-  final _repository    = FaceAuthRepository();
 
   late final AnimationController _pulseController;
   late final AnimationController _shakeController;
@@ -71,9 +69,15 @@ class _FaceLoginPageState extends State<FaceLoginPage>
   String  _statusMessage       = 'Initializing…';
   double? _matchPercentage;
 
-  // 2 frames: fast + noise-resistant for unlock flow
-  static const int _verifyFrames = 2;
-  final List<List<double>> _embeds = [];
+  // Collect 8 good-quality frames.
+  // Require _minPassFrames to INDIVIDUALLY pass cosine threshold.
+  // This prevents a friend's face from passing via lucky averaged frames.
+  static const int    _verifyFrames  = 8;
+  static const int    _minPassFrames = 6;   // 6 of 8 must individually match
+  static const double _cosineThresh  = 0.60; // MlFaceService.matchThreshold
+
+  final List<List<double>> _embeds     = [];
+  final List<double>       _cosineList = [];
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
@@ -103,6 +107,30 @@ class _FaceLoginPageState extends State<FaceLoginPage>
   // ── Init ──────────────────────────────────────────────────────────────────────
 
   Future<void> _initAll() async {
+    // ── Stale vector check ──────────────────────────────────────────────────
+    // The uint8 → float32 preprocessing fix means any vector saved before
+    // this update is in a completely different embedding space.
+    // Stale vector + float32 live vector → cosine ≈ 0 → owner can never login.
+    //
+    // Detect this by checking the version tag saved alongside the vector.
+    // Missing tag OR wrong version → delete vector → force re-registration.
+    final storage = context.read<StorageService>();
+    if (!storage.isEmbeddingVersionCurrent()) {
+      debugPrint('[FaceLogin] ⚠ Stale face vector detected '
+          '(version=${storage.getEmbeddingVersion() ?? "none"}) — '
+          'deleting and forcing re-registration');
+      await storage.deleteFaceVector(); // also clears version tag
+      if (!mounted) return;
+      // Show brief message before redirecting
+      _safeSetState(() =>
+      _statusMessage = 'Face data updated — please re-register');
+      await Future.delayed(const Duration(milliseconds: 1500));
+      if (mounted) {
+        Navigator.of(context).pushReplacementNamed('/registration');
+      }
+      return; // do NOT start camera/ML
+    }
+    // ── Normal init ──────────────────────────────────────────────────────────
     await Future.wait([_initCamera(), _initMl()]);
   }
 
@@ -204,8 +232,19 @@ class _FaceLoginPageState extends State<FaceLoginPage>
       }
 
       _embeds.add(result.embedding!);
-      _safeSetState(() =>
-      _statusMessage = 'Scanning… ${_embeds.length}/$_verifyFrames');
+
+      // Per-frame cosine check against stored vector (fast, no await)
+      final stored = _mlService.cachedStoredVector;
+      if (stored != null) {
+        final cosine = MlFaceService.cosineSimilarity(stored, result.embedding!);
+        _cosineList.add(cosine);
+        final passing = _cosineList.where((c) => c >= _cosineThresh).length;
+        _safeSetState(() =>
+        _statusMessage = 'Scanning… ${_embeds.length}/$_verifyFrames  ✓$passing');
+      } else {
+        _safeSetState(() =>
+        _statusMessage = 'Scanning… ${_embeds.length}/$_verifyFrames');
+      }
 
       if (_embeds.length >= _verifyFrames) {
         _isScanning = false;
@@ -230,13 +269,45 @@ class _FaceLoginPageState extends State<FaceLoginPage>
         return;
       }
 
-      // Average collected embeddings then L2-normalise
-      final dim      = _embeds.first.length;
+      final stored = storedVector.vector;
+
+      // ── Step 1: Per-frame cosine check ──────────────────────────────────
+      // Count how many of the collected frames individually pass the threshold.
+      // A friend's face will rarely pass even 1–2 frames; the real owner
+      // should pass 6+ out of 8.
+      final perFrameCosines = _embeds
+          .map((e) => MlFaceService.cosineSimilarity(stored, e))
+          .toList();
+
+      final passingFrames = perFrameCosines
+          .where((c) => c >= _cosineThresh)
+          .length;
+
+      debugPrint('[FaceLogin] per-frame cosines: '
+          '${perFrameCosines.map((c) => c.toStringAsFixed(3)).join(', ')}');
+      debugPrint('[FaceLogin] passing=$passingFrames / '
+          '${_embeds.length} (need $_minPassFrames)');
+
+      if (passingFrames < _minPassFrames) {
+        _handleFailure(
+            'Not your face ($passingFrames/${_embeds.length} frames matched)');
+        return;
+      }
+
+      // ── Step 2: Average only the passing frames → final score ────────────
+      final passingEmbeds = <List<double>>[];
+      for (int i = 0; i < _embeds.length; i++) {
+        if (perFrameCosines[i] >= _cosineThresh) {
+          passingEmbeds.add(_embeds[i]);
+        }
+      }
+
+      final dim      = passingEmbeds.first.length;
       final averaged = List<double>.filled(dim, 0.0);
-      for (final e in _embeds) {
+      for (final e in passingEmbeds) {
         for (int i = 0; i < dim; i++) averaged[i] += e[i];
       }
-      for (int i = 0; i < dim; i++) averaged[i] /= _embeds.length;
+      for (int i = 0; i < dim; i++) averaged[i] /= passingEmbeds.length;
 
       double norm = 0;
       for (final v in averaged) norm += v * v;
@@ -244,26 +315,22 @@ class _FaceLoginPageState extends State<FaceLoginPage>
       final normalised =
       norm < 1e-10 ? averaged : averaged.map((v) => v / norm).toList();
 
-      final liveVector = FaceVectorModel(
-        id:        'live_${DateTime.now().millisecondsSinceEpoch}',
-        vector:    normalised,
-        createdAt: DateTime.now(),
-        userId:    storedVector.userId,
-      );
+      // ── Step 3: Final cosine check on averaged passing embedding ─────────
+      final finalCosine = MlFaceService.cosineSimilarity(stored, normalised);
+      final finalScore  = MlFaceService.matchPercentage(stored, normalised);
 
-      final result = await _repository.verifyFace(
-        liveVector:   liveVector,
-        storedVector: storedVector,
-      );
+      debugPrint('[FaceLogin] final cosine=${finalCosine.toStringAsFixed(4)} '
+          'score=${finalScore.toStringAsFixed(1)}%  '
+          'threshold=$_cosineThresh');
 
       if (!mounted) return;
 
-      if (result.isMatch) {
+      if (finalCosine >= _cosineThresh) {
         _safeSetState(() {
-          _isVerifying      = false;
-          _isDone           = true;
-          _matchPercentage  = result.matchPercentage;
-          _statusMessage    = 'Verified! Unlocking…';
+          _isVerifying     = false;
+          _isDone          = true;
+          _matchPercentage = finalScore;
+          _statusMessage   = 'Verified! Unlocking…';
         });
         HapticFeedback.heavyImpact();
 
@@ -271,7 +338,8 @@ class _FaceLoginPageState extends State<FaceLoginPage>
         await Future.delayed(const Duration(milliseconds: 1200));
         if (mounted) Navigator.of(context).pushReplacementNamed('/dashboard');
       } else {
-        _handleFailure(result.message);
+        _handleFailure(
+            'Face does not match (${finalScore.toStringAsFixed(0)}%)');
       }
     } catch (e) {
       debugPrint('[FaceLogin] verification error: $e');
@@ -293,6 +361,7 @@ class _FaceLoginPageState extends State<FaceLoginPage>
     Future.delayed(const Duration(milliseconds: 800), () {
       if (!mounted) return;
       _embeds.clear();
+      _cosineList.clear();
       _safeSetState(() {
         _verificationFailed = false;
         _isScanning         = true;

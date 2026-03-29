@@ -63,6 +63,7 @@ class StorageService {
     _ensureInitialized();
     await _secureStorage.delete(key: AppConstants.keyFaceVector);
     await _prefs.setBool(AppConstants.keyIsRegistered, false);
+    await _prefs.remove(_kEmbeddingVersion); // clear stale version tag
   }
 
   Future<bool> isFaceRegistered() async {
@@ -82,7 +83,42 @@ class StorageService {
     return await _secureStorage.read(key: AppConstants.keyUserId);
   }
 
-  // ==================== FACE IMAGE STORAGE (log evidence) ====================
+  // ==================== EMBEDDING VERSION ====================
+  //
+  // Tracks which preprocessing was used when the face vector was saved.
+  // If version != MlFaceService.embeddingVersion, the stored vector is stale
+  // (registered with old uint8 preprocessing) and must be discarded.
+  //
+  // Version history:
+  //   (none / missing) → uint8 raw [0-255] input  ← WRONG, produces 99% for all
+  //   'float32_v1'     → normalized [-1,1] input   ← CORRECT
+
+  static const _kEmbeddingVersion = 'nanopanda_embedding_version';
+  static const currentEmbeddingVersion = 'float32_v1';
+
+  Future<void> saveEmbeddingVersion(String version) async {
+    _ensureInitialized();
+    await _prefs.setString(_kEmbeddingVersion, version);
+  }
+
+  String? getEmbeddingVersion() {
+    _ensureInitialized();
+    return _prefs.getString(_kEmbeddingVersion);
+  }
+
+  Future<void> clearEmbeddingVersion() async {
+    _ensureInitialized();
+    await _prefs.remove(_kEmbeddingVersion);
+  }
+
+  /// Returns true if the stored face vector was registered with the current
+  /// (correct float32) preprocessing. Returns false if stale or missing.
+  bool isEmbeddingVersionCurrent() {
+    final v = getEmbeddingVersion();
+    return v == currentEmbeddingVersion;
+  }
+
+
 
   /// Saves a JPEG of an intruder's face to documents/face_logs/.
   /// Returns the absolute file path to store in LogEntryModel.faceImagePath.

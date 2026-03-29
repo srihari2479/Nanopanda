@@ -82,9 +82,10 @@ class FaceOverlayPage extends StatefulWidget {
 class _FaceOverlayPageState extends State<FaceOverlayPage>
     with WidgetsBindingObserver {
 
-  static const _maxAttempts    = 3;
-  static const _frameInterval  = Duration(milliseconds: 400);
-  static const _resultHoldMs   = 1800; // show result screen before popping
+  static const _maxAttempts    = 5;   // good-quality frames to collect
+  static const _minPassFrames  = 4;   // frames that must individually pass
+  static const _cosineThresh   = 0.60; // MlFaceService.matchThreshold
+  static const _resultHoldMs   = 1800;
 
   static const _screenChannel  = EventChannel('nanopanda/screen_events');
 
@@ -92,15 +93,19 @@ class _FaceOverlayPageState extends State<FaceOverlayPage>
 
   // State
   _OverlayState _state      = _OverlayState.scanning;
-  int           _attempts   = 0;
+  int           _goodFrames = 0;   // frames with a face + good quality
   double?       _lastScore;
   Uint8List?    _capturedJpeg;
-  String        _statusMsg  = 'Verifying identity…';
+  String        _statusMsg  = 'Look at the camera…';
 
-  Timer?                        _frameTimer;
+  // Per-frame cosine tracking for consistency check
+  final List<List<double>> _frameEmbeds  = [];
+  final List<double>       _frameCosines = [];
+
   StreamSubscription<dynamic>?  _screenSub;
   bool                          _processingFrame = false;
   bool                          _done            = false;
+  bool                          _streamStarted   = false;
 
   @override
   void initState() {
@@ -113,8 +118,10 @@ class _FaceOverlayPageState extends State<FaceOverlayPage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _frameTimer?.cancel();
     _screenSub?.cancel();
+    if (_streamStarted) {
+      _cameraService.controller?.stopImageStream().catchError((_) {});
+    }
     _cameraService.dispose();
     super.dispose();
   }
@@ -137,90 +144,121 @@ class _FaceOverlayPageState extends State<FaceOverlayPage>
       await _cameraService.initialize();
       if (!mounted) return;
       setState(() {});
-      _startFrameLoop();
+      _startFrameStream();
     } catch (e) {
       debugPrint('[FaceOverlay] camera init error: $e');
       if (mounted) setState(() => _statusMsg = 'Camera unavailable');
-      // Treat as unknown — no face, unauthorized after short delay
       await Future.delayed(const Duration(seconds: 2));
       _finish(authorized: false, reason: 'camera_unavailable');
     }
   }
 
-  // ── Frame loop ─────────────────────────────────────────────────────────────
-
-  void _startFrameLoop() {
-    _frameTimer = Timer.periodic(_frameInterval, (_) => _processNextFrame());
+  void _startFrameStream() {
+    if (_streamStarted || _done) return;
+    _streamStarted = true;
+    _cameraService.controller?.startImageStream(_onFrame);
+    debugPrint('[FaceOverlay] frame stream started');
   }
 
-  Future<void> _processNextFrame() async {
+  Future<void> _stopFrameStream() async {
+    if (!_streamStarted) return;
+    _streamStarted = false;
+    try {
+      await _cameraService.controller?.stopImageStream();
+    } catch (_) {}
+  }
+
+  // ── Frame handler (image stream) ──────────────────────────────────────────
+  //
+  // Uses MlFaceService.processFrame() — same pipeline as face_login_page:
+  //   YUV → NV21 → ML Kit face detection → face crop → FaceNet embedding.
+  // Only good-quality frontal frames (eulerY<25°, eyes open) are counted.
+  //
+  // Consistency check:
+  //   Collect _maxAttempts good frames.
+  //   Require _minPassFrames to individually pass cosine ≥ _cosineThresh.
+  //   Only then declare authorized.
+
+  Future<void> _onFrame(CameraImage frame) async {
     if (_processingFrame || _done || !_cameraService.isReady) return;
     _processingFrame = true;
 
     try {
-      // Grab one frame via takePicture (simpler than startImageStream for
-      // occasional sampling — avoids the stream complexity here)
-      final xfile  = await _cameraService.controller!.takePicture();
-      final bytes  = await xfile.readAsBytes();
-
-      final embedding = await MlFaceService.instance
-          .extractEmbeddingFromBytes(bytes);
+      final result = await MlFaceService.instance.processFrame(
+        frame,
+        _cameraService.controller!.description.sensorOrientation,
+      );
 
       if (_done) return;
 
-      _attempts++;
-
-      if (embedding == null) {
-        debugPrint('[FaceOverlay] attempt $_attempts — no face');
-        if (mounted) setState(() => _statusMsg = 'No face detected…');
-        if (_attempts >= _maxAttempts) {
-          _finish(authorized: false, reason: 'no_face');
-        }
+      if (!result.faceFound) {
+        if (mounted) setState(() => _statusMsg = 'No face — look at camera');
         return;
       }
 
-      // Save first captured JPEG as evidence
-      _capturedJpeg ??= bytes;
+      if (!result.goodQuality) {
+        if (mounted) setState(() => _statusMsg = result.statusMessage);
+        return;
+      }
+
+      if (!result.hasEmbedding || result.embedding == null) return;
+
+      _goodFrames++;
+
+      // Capture first JPEG as evidence (take picture once)
+      if (_capturedJpeg == null) {
+        try {
+          final xfile = await _cameraService.controller!.takePicture();
+          _capturedJpeg = await xfile.readAsBytes();
+        } catch (_) {}
+      }
 
       final stored = MlFaceService.instance.cachedStoredVector;
       if (stored == null) {
-        // No registered face — let through (shouldn't happen in practice)
         _finish(authorized: true, reason: 'no_stored_vector');
         return;
       }
 
-      final score   = MlFaceService.matchPercentage(stored, embedding);
-      _lastScore    = score;
-      final matched = score >= MlFaceService.matchThreshold * 100;
+      final cosine = MlFaceService.cosineSimilarity(stored, result.embedding!);
+      final score  = MlFaceService.matchPercentage(stored, result.embedding!);
+      _frameEmbeds.add(result.embedding!);
+      _frameCosines.add(cosine);
+      _lastScore = score;
 
-      debugPrint('[FaceOverlay] attempt $_attempts — '
-          'score=${score.toStringAsFixed(1)}% matched=$matched');
+      final passing = _frameCosines.where((c) => c >= _cosineThresh).length;
 
-      if (matched) {
-        _finish(authorized: true, reason: 'match');
-        return;
-      }
+      debugPrint('[FaceOverlay] frame $_goodFrames — '
+          'cosine=${cosine.toStringAsFixed(3)} '
+          'score=${score.toStringAsFixed(1)}% passing=$passing');
 
       if (mounted) {
         setState(() => _statusMsg =
-        'Match: ${score.toStringAsFixed(0)}% (need ≥75%)');
+        'Scanning… $_goodFrames/$_maxAttempts  ✓$passing');
       }
 
-      if (_attempts >= _maxAttempts) {
-        _finish(authorized: false, reason: 'mismatch');
+      if (_goodFrames >= _maxAttempts) {
+        await _stopFrameStream();
+        _evaluateResult();
       }
     } catch (e) {
-      debugPrint('[FaceOverlay] frame error: $e');
-      _attempts++;
-      if (_attempts >= _maxAttempts) {
-        _finish(authorized: false, reason: 'error');
-      }
+      debugPrint('[FaceOverlay] _onFrame error: $e');
     } finally {
       _processingFrame = false;
     }
   }
 
-  // ── Finish ─────────────────────────────────────────────────────────────────
+  void _evaluateResult() {
+    final passing = _frameCosines.where((c) => c >= _cosineThresh).length;
+
+    debugPrint('[FaceOverlay] evaluation: passing=$passing/$_maxAttempts '
+        'need=$_minPassFrames');
+
+    if (passing >= _minPassFrames) {
+      _finish(authorized: true, reason: 'match');
+    } else {
+      _finish(authorized: false, reason: 'mismatch');
+    }
+  }
 
   Future<void> _finish({
     required bool   authorized,
@@ -228,22 +266,20 @@ class _FaceOverlayPageState extends State<FaceOverlayPage>
   }) async {
     if (_done) return;
     _done = true;
-    _frameTimer?.cancel();
+    await _stopFrameStream();
 
-    // Show result screen briefly
     if (mounted) {
       setState(() {
         _state = authorized ? _OverlayState.authorized : _OverlayState.denied;
       });
     }
 
-    // Deliver result to MonitoringProvider
     final result = OverlayResult(
       packageName:  widget.packageName,
       authorized:   authorized,
       matchScore:   _lastScore,
-      faceJpeg:     authorized ? null : _capturedJpeg, // only save on failure
-      attemptCount: _attempts.clamp(1, _maxAttempts),
+      faceJpeg:     authorized ? null : _capturedJpeg,
+      attemptCount: _goodFrames.clamp(1, _maxAttempts),
       detectedAt:   widget.detectedAt,
     );
 
@@ -251,7 +287,7 @@ class _FaceOverlayPageState extends State<FaceOverlayPage>
       context.read<MonitoringProvider>().onOverlayResult(result);
     }
 
-    await Future.delayed(Duration(milliseconds: _resultHoldMs));
+    await Future.delayed(const Duration(milliseconds: _resultHoldMs));
     if (mounted) Navigator.of(context).pop();
   }
 
@@ -287,7 +323,7 @@ class _FaceOverlayPageState extends State<FaceOverlayPage>
         return _ScanningView(
           appName:    widget.appName,
           statusMsg:  _statusMsg,
-          attempts:   _attempts,
+          attempts:   _goodFrames,
           maxAttempts: _maxAttempts,
         );
       case _OverlayState.authorized:
